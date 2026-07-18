@@ -1,0 +1,136 @@
+import 'dotenv/config';
+
+const REQUIRED_ENVIRONMENT_VARIABLES = [
+  'DISCORD_TOKEN',
+  'DISCORD_CLIENT_ID',
+  'DISCORD_GUILD_ID',
+  'APPS_SCRIPT_URL',
+  'FCBOT_API_KEY',
+];
+
+function parsePositiveInteger(name, fallback) {
+  const rawValue = process.env[name];
+  if (rawValue === undefined || rawValue.trim() === '') return fallback;
+
+  const parsed = Number.parseInt(rawValue, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    throw new Error(`${name} must be a positive integer.`);
+  }
+
+  return parsed;
+}
+
+function parsePositiveIntegerWithLegacy(
+  name,
+  legacyName,
+  fallback,
+) {
+  if (process.env[name]?.trim()) {
+    return parsePositiveInteger(name, fallback);
+  }
+
+  if (process.env[legacyName]?.trim()) {
+    return parsePositiveInteger(legacyName, fallback);
+  }
+
+  return fallback;
+}
+
+function parseBoolean(name, fallback) {
+  const rawValue = process.env[name];
+  if (rawValue === undefined || rawValue.trim() === '') return fallback;
+
+  const normalized = rawValue.trim().toLowerCase();
+
+  if (['true', '1', 'yes', 'on'].includes(normalized)) return true;
+  if (['false', '0', 'no', 'off'].includes(normalized)) return false;
+
+  throw new Error(`${name} must be true or false.`);
+}
+
+function requireEnvironment() {
+  const missing = REQUIRED_ENVIRONMENT_VARIABLES.filter(
+    (name) => !process.env[name] || !process.env[name].trim(),
+  );
+
+  if (missing.length > 0) {
+    throw new Error(
+      `Missing required environment variables: ${missing.join(', ')}. ` +
+        'Copy .env.example to .env and fill in the five required values.',
+    );
+  }
+
+  const appsScriptUrl = process.env.APPS_SCRIPT_URL.trim();
+  let parsedUrl;
+
+  try {
+    parsedUrl = new URL(appsScriptUrl);
+  } catch {
+    throw new Error('APPS_SCRIPT_URL is not a valid URL.');
+  }
+
+  if (parsedUrl.protocol !== 'https:') {
+    throw new Error('APPS_SCRIPT_URL must use HTTPS.');
+  }
+
+  if (!parsedUrl.pathname.endsWith('/exec')) {
+    throw new Error(
+      'APPS_SCRIPT_URL must be the deployed web-app URL ending in /exec.',
+    );
+  }
+}
+
+requireEnvironment();
+
+const autocompleteSyncMinutes = parsePositiveIntegerWithLegacy(
+  'AUTOCOMPLETE_SYNC_MINUTES',
+  'AUTOCOMPLETE_REFRESH_MINUTES',
+  5,
+);
+
+const autocompleteRetryBaseSeconds = parsePositiveInteger(
+  'AUTOCOMPLETE_RETRY_BASE_SECONDS',
+  30,
+);
+
+const autocompleteRetryMaxMinutes = parsePositiveInteger(
+  'AUTOCOMPLETE_RETRY_MAX_MINUTES',
+  10,
+);
+
+export const config = Object.freeze({
+  port: parsePositiveInteger('PORT', 3_000),
+
+  discordToken: process.env.DISCORD_TOKEN.trim(),
+  discordClientId: process.env.DISCORD_CLIENT_ID.trim(),
+  discordGuildId: process.env.DISCORD_GUILD_ID.trim(),
+  appsScriptUrl: process.env.APPS_SCRIPT_URL.trim(),
+  apiKey: process.env.FCBOT_API_KEY.trim(),
+
+  ephemeralReplies: parseBoolean('EPHEMERAL_REPLIES', true),
+
+  appsScriptTimeoutMs: parsePositiveInteger(
+    'APPS_SCRIPT_TIMEOUT_MS',
+    120_000,
+  ),
+
+  autocompleteTimeoutMs: Math.min(
+    parsePositiveInteger('AUTOCOMPLETE_TIMEOUT_MS', 2_400),
+    2_800,
+  ),
+
+  autocompleteCacheMs:
+    parsePositiveInteger('AUTOCOMPLETE_CACHE_SECONDS', 20) * 1_000,
+
+  autocompleteCatalogPageSize: Math.min(
+    parsePositiveInteger('AUTOCOMPLETE_CATALOG_PAGE_SIZE', 5_000),
+    5_000,
+  ),
+
+  // This is now a lightweight revision-check interval. The complete catalog
+  // is downloaded only when the Apps Script revision changes.
+  autocompleteSyncCheckMs: autocompleteSyncMinutes * 60_000,
+
+  autocompleteRetryBaseMs: autocompleteRetryBaseSeconds * 1_000,
+  autocompleteRetryMaxMs: autocompleteRetryMaxMinutes * 60_000,
+});

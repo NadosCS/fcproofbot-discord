@@ -1,0 +1,39 @@
+services:
+  - type: web
+    name: ultimate-clone-hero-fc-proof-bot
+    runtime: node
+    plan: free
+    region: frankfurt
+    branch: main
+    buildCommand: npm ci --omit=dev
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    maxShutdownDelaySeconds: 30
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: DISCORD_CLIENT_ID
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: APPS_SCRIPT_URL
+        sync: false
+      - key: FCBOT_API_KEY
+        sync: false
+      - key: EPHEMERAL_REPLIES
+        value: "true"
+      - key: APPS_SCRIPT_TIMEOUT_MS
+        value: "120000"
+      - key: AUTOCOMPLETE_TIMEOUT_MS
+        value: "2400"
+      - key: AUTOCOMPLETE_CACHE_SECONDS
+        value: "20"
+      - key: AUTOCOMPLETE_CATALOG_PAGE_SIZE
+        value: "5000"
+      - key: AUTOCOMPLETE_SYNC_MINUTES
+        value: "5"
+      - key: AUTOCOMPLETE_RETRY_BASE_SECONDS
+        value: "30"
+      - key: AUTOCOMPLETE_RETRY_MAX_MINUTES
+        value: "10"

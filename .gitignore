@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Secret environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Local caches and editor files
+.cache/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Coverage/build output
+coverage/
+dist/
+build/
