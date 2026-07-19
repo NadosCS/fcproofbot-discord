@@ -432,6 +432,38 @@ function validHttpsUrl(value) {
   }
 }
 
+function isDiscordProofUrl(value) {
+  try {
+    const hostname = new URL(value).hostname
+      .toLowerCase()
+      .replace(/\.$/, '');
+
+    const blockedDiscordHosts = [
+      'discord.com',
+      'discordapp.com',
+      'discordapp.net',
+      'discord.gg',
+      'discordcdn.com',
+    ];
+
+    return blockedDiscordHosts.some(
+      (blockedHost) =>
+        hostname === blockedHost ||
+        hostname.endsWith(`.${blockedHost}`),
+    );
+  } catch {
+    return false;
+  }
+}
+
+function discordProofRejectedMessage() {
+  return (
+    '❌ Discord-hosted proof links are not accepted because they may expire. ' +
+    'Please upload the proof to a permanent host such as ImgChest, Imgur, ' +
+    'YouTube, or Streamable, then submit that HTTPS link instead.'
+  );
+}
+
 function replyVisibilityFlags() {
   return config.ephemeralReplies
     ? MessageFlags.Ephemeral
@@ -692,6 +724,14 @@ async function handleAddProof(interaction) {
     return;
   }
 
+  if (isDiscordProofUrl(proofUrl)) {
+    await replyToInteraction(interaction, {
+      content: discordProofRejectedMessage(),
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
   await deferCommand(interaction);
 
   const songRef = await resolveSongReference(
@@ -786,6 +826,17 @@ async function handleEditProof(interaction) {
   ) {
     await replyToInteraction(interaction, {
       content: '❌ The proof must be a valid HTTPS URL.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (
+    proofOption !== null &&
+    isDiscordProofUrl(proofOption.trim())
+  ) {
+    await replyToInteraction(interaction, {
+      content: discordProofRejectedMessage(),
       flags: MessageFlags.Ephemeral,
     });
     return;
