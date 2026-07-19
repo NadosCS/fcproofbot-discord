@@ -109,6 +109,27 @@ export const config = Object.freeze({
 
   ephemeralReplies: parseBoolean('EPHEMERAL_REPLIES', true),
 
+  // Discord requires the initial interaction acknowledgement within three
+  // seconds. Keep this below that deadline.
+  discordAckTimeoutMs: Math.min(
+    parsePositiveInteger('DISCORD_ACK_TIMEOUT_MS', 2_200),
+    2_700,
+  ),
+
+  // Editing the deferred response is less time-sensitive but still must never
+  // be allowed to hang for minutes.
+  discordResponseTimeoutMs: Math.min(
+    parsePositiveInteger('DISCORD_RESPONSE_TIMEOUT_MS', 10_000),
+    30_000,
+  ),
+
+  // Applies only to the remaining discord.js REST calls. Interaction
+  // callbacks use the direct, abortable transport in index.js.
+  discordRestTimeoutMs: Math.min(
+    parsePositiveInteger('DISCORD_REST_TIMEOUT_MS', 10_000),
+    30_000,
+  ),
+
   // Keep ordinary backend calls safely below Discord's interaction-token
   // lifetime. The value is capped even if a hosting-panel variable is set too
   // high by mistake.

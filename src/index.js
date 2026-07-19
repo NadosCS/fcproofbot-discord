@@ -1,3 +1,5 @@
+import { setDefaultResultOrder } from 'node:dns';
+
 import {
   Client,
   EmbedBuilder,
@@ -21,8 +23,16 @@ import {
   stopHealthServer,
 } from './health-server.js';
 
+// Wispbyte's outbound IPv6 route can intermittently stall while the Discord
+// Gateway remains connected. Prefer IPv4 for Discord/Google HTTPS lookups.
+setDefaultResultOrder('ipv4first');
+
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
+  rest: {
+    timeout: config.discordRestTimeoutMs,
+    retries: 0,
+  },
 });
 
 let catalogSyncTimer = null;
@@ -35,6 +45,291 @@ let shutdownStarted = false;
 // can emit a new request for every keystroke, so older requests should not send
 // a response after a newer one has already replaced them.
 const latestAutocompleteRequests = new Map();
+
+// Interaction callbacks are sent directly instead of through discord.js' shared
+// REST queue. On some shared hosting nodes, one stalled callback can otherwise
+// block every later autocomplete response and slash-command acknowledgement.
+const acknowledgedInteractions = new WeakSet();
+const respondedAutocompleteInteractions = new WeakSet();
+
+class DiscordHttpError extends Error {
+  constructor(message, options = {}) {
+    super(message);
+    this.name = 'DiscordHttpError';
+    this.code = options.code ?? 'DISCORD_HTTP_ERROR';
+    this.status = options.status ?? null;
+    this.details = options.details ?? null;
+    this.cause = options.cause;
+  }
+}
+
+function discordApiPayload(payload = {}) {
+  if (typeof payload === 'string') {
+    return { content: payload };
+  }
+
+  const data = {};
+
+  if (payload.content !== undefined) {
+    data.content = payload.content;
+  }
+
+  if (Array.isArray(payload.embeds)) {
+    data.embeds = payload.embeds.map((embed) =>
+      typeof embed?.toJSON === 'function'
+        ? embed.toJSON()
+        : embed
+    );
+  }
+
+  if (Array.isArray(payload.components)) {
+    data.components = payload.components.map((component) =>
+      typeof component?.toJSON === 'function'
+        ? component.toJSON()
+        : component
+    );
+  }
+
+  if (payload.allowedMentions) {
+    const allowed = payload.allowedMentions;
+    const normalized = {};
+
+    if (Array.isArray(allowed.parse)) {
+      normalized.parse = allowed.parse;
+    }
+
+    if (Array.isArray(allowed.users)) {
+      normalized.users = allowed.users.map(String);
+    }
+
+    if (Array.isArray(allowed.roles)) {
+      normalized.roles = allowed.roles.map(String);
+    }
+
+    if (typeof allowed.repliedUser === 'boolean') {
+      normalized.replied_user = allowed.repliedUser;
+    }
+
+    data.allowed_mentions = normalized;
+  }
+
+  if (payload.flags !== undefined) {
+    data.flags = Number(payload.flags);
+  }
+
+  if (payload.tts !== undefined) {
+    data.tts = Boolean(payload.tts);
+  }
+
+  return data;
+}
+
+function discordRequestTimeoutError(timeoutMs, label) {
+  return new DiscordHttpError(
+    `${label} exceeded ${timeoutMs} ms.`,
+    {
+      code: 'DISCORD_REQUEST_TIMEOUT',
+      details: { timeoutMs, label },
+    },
+  );
+}
+
+async function directDiscordRequest(
+  url,
+  {
+    method = 'POST',
+    body,
+    headers = {},
+    timeoutMs,
+    label,
+  },
+) {
+  const controller = new AbortController();
+  const timeoutError = discordRequestTimeoutError(timeoutMs, label);
+  let timeoutHandle;
+
+  const timeoutPromise = new Promise((resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+
+  const requestPromise = (async () => {
+    const response = await fetch(url, {
+      method,
+      headers: {
+        accept: 'application/json',
+        'content-type': 'application/json; charset=utf-8',
+        ...headers,
+      },
+      body: body === undefined
+        ? undefined
+        : JSON.stringify(body),
+      signal: controller.signal,
+    });
+
+    const text = await response.text();
+    let result = null;
+
+    if (text) {
+      try {
+        result = JSON.parse(text);
+      } catch {
+        result = { message: text.slice(0, 500) };
+      }
+    }
+
+    if (!response.ok) {
+      throw new DiscordHttpError(
+        result?.message ||
+          `${label} returned HTTP ${response.status}.`,
+        {
+          code: result?.code ?? 'DISCORD_HTTP_ERROR',
+          status: response.status,
+          details: result,
+        },
+      );
+    }
+
+    return result;
+  })();
+
+  try {
+    return await Promise.race([requestPromise, timeoutPromise]);
+  } catch (error) {
+    if (error instanceof DiscordHttpError) {
+      throw error;
+    }
+
+    if (
+      error?.name === 'AbortError' ||
+      error?.code === 'ABORT_ERR'
+    ) {
+      const wrapped = discordRequestTimeoutError(timeoutMs, label);
+      wrapped.cause = error;
+      throw wrapped;
+    }
+
+    throw new DiscordHttpError(
+      `${label} failed: ${error?.message || String(error)}`,
+      {
+        code: 'DISCORD_REQUEST_FAILED',
+        cause: error,
+      },
+    );
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
+}
+
+function interactionCallbackUrl(interaction) {
+  return (
+    `https://discord.com/api/v10/interactions/` +
+    `${interaction.id}/${interaction.token}/callback`
+  );
+}
+
+function originalInteractionMessageUrl(interaction) {
+  return (
+    `https://discord.com/api/v10/webhooks/` +
+    `${config.discordClientId}/${interaction.token}/messages/@original`
+  );
+}
+
+async function deferInteraction(interaction, flags) {
+  const startedAt = Date.now();
+  const data = flags ? { flags: Number(flags) } : {};
+
+  await directDiscordRequest(interactionCallbackUrl(interaction), {
+    method: 'POST',
+    body: {
+      type: 5,
+      data,
+    },
+    timeoutMs: config.discordAckTimeoutMs,
+    label: `Discord acknowledgement for /${interaction.commandName}`,
+  });
+
+  acknowledgedInteractions.add(interaction);
+
+  console.log(
+    `Command acknowledged: /${interaction.commandName} ` +
+      `(${interaction.id}) in ${Date.now() - startedAt} ms.`,
+  );
+}
+
+async function replyToInteraction(interaction, payload) {
+  await directDiscordRequest(interactionCallbackUrl(interaction), {
+    method: 'POST',
+    body: {
+      type: 4,
+      data: discordApiPayload(payload),
+    },
+    timeoutMs: config.discordAckTimeoutMs,
+    label: `Discord initial reply for /${interaction.commandName}`,
+  });
+
+  acknowledgedInteractions.add(interaction);
+}
+
+async function editInteractionReply(interaction, payload) {
+  if (!acknowledgedInteractions.has(interaction)) {
+    throw new DiscordHttpError(
+      'Cannot edit a Discord interaction before it has been acknowledged.',
+      {
+        code: 'INTERACTION_NOT_ACKNOWLEDGED',
+      },
+    );
+  }
+
+  return directDiscordRequest(originalInteractionMessageUrl(interaction), {
+    method: 'PATCH',
+    body: discordApiPayload(payload),
+    timeoutMs: config.discordResponseTimeoutMs,
+    label: `Discord response for /${interaction.commandName}`,
+  });
+}
+
+async function respondToAutocomplete(interaction, choices) {
+  await directDiscordRequest(interactionCallbackUrl(interaction), {
+    method: 'POST',
+    body: {
+      type: 8,
+      data: {
+        choices,
+      },
+    },
+    timeoutMs: config.discordAckTimeoutMs,
+    label:
+      `Discord autocomplete response for ` +
+      `${interaction.commandName}`,
+  });
+
+  respondedAutocompleteInteractions.add(interaction);
+}
+
+async function sendDirectChannelMessage(channelId, payload) {
+  if (!channelId) {
+    throw new DiscordHttpError(
+      'A Discord channel ID is required for the fallback response.',
+      { code: 'MISSING_CHANNEL_ID' },
+    );
+  }
+
+  return directDiscordRequest(
+    `https://discord.com/api/v10/channels/${channelId}/messages`,
+    {
+      method: 'POST',
+      body: discordApiPayload(payload),
+      headers: {
+        authorization: `Bot ${config.discordToken}`,
+      },
+      timeoutMs: config.discordResponseTimeoutMs,
+      label: 'Discord fallback channel message',
+    },
+  );
+}
 
 function discordUserLabel(interaction) {
   const displayName =
@@ -61,6 +356,13 @@ function isExpiredInteractionError(error) {
   return [10015, 10062, 50027].includes(discordErrorCode(error));
 }
 
+function isIgnorableAutocompleteError(error) {
+  return (
+    isExpiredInteractionError(error) ||
+    error?.code === 'DISCORD_REQUEST_TIMEOUT'
+  );
+}
+
 function autocompleteRequestKey(interaction, focused) {
   return [
     interaction.guildId || 'direct-message',
@@ -81,10 +383,10 @@ async function sendCommandError(interaction, error) {
   };
 
   try {
-    if (interaction.deferred || interaction.replied) {
-      await interaction.editReply(responsePayload);
+    if (acknowledgedInteractions.has(interaction)) {
+      await editInteractionReply(interaction, responsePayload);
     } else {
-      await interaction.reply({
+      await replyToInteraction(interaction, {
         ...responsePayload,
         flags: MessageFlags.Ephemeral,
       });
@@ -102,14 +404,9 @@ async function sendCommandError(interaction, error) {
   // If Discord has invalidated the interaction webhook, fall back to a normal
   // channel message so the command never remains on "Bot is thinking..."
   // without any visible explanation.
-  const channel = interaction.channel;
-
-  if (
-    channel?.isTextBased?.() &&
-    typeof channel.send === 'function'
-  ) {
+  if (interaction.channelId) {
     try {
-      await channel.send({
+      await sendDirectChannelMessage(interaction.channelId, {
         content: `<@${interaction.user.id}> ${content}`,
         allowedMentions: {
           parse: [],
@@ -144,11 +441,12 @@ function replyVisibilityFlags() {
 async function deferCommand(interaction) {
   const flags = replyVisibilityFlags();
 
-  if (flags) {
-    await interaction.deferReply({ flags });
-  } else {
-    await interaction.deferReply();
-  }
+  console.log(
+    `Acknowledging command: /${interaction.commandName} ` +
+      `(${interaction.id}).`,
+  );
+
+  await deferInteraction(interaction, flags);
 }
 
 function successEmbed(title, data) {
@@ -308,18 +606,23 @@ async function handleAutocomplete(interaction) {
 
   latestAutocompleteRequests.set(requestKey, interaction.id);
 
+  // Discord sends an autocomplete event as soon as the option receives focus.
+  // Returning without an HTTP callback for the empty value avoids generating
+  // a burst of disposable requests before the user has typed anything.
+  if (!query) {
+    return;
+  }
+
   try {
     let choices = [];
 
-    if (query) {
-      if (focused.name === 'song') {
+    if (focused.name === 'song') {
         const onlyUnfcd =
           interaction.commandName === 'addproof';
 
         choices = await searchSongs(query, onlyUnfcd);
-      } else if (focused.name === 'player') {
-        choices = await searchPlayers(query);
-      }
+    } else if (focused.name === 'player') {
+      choices = await searchPlayers(query);
     }
 
     // A newer keystroke has already produced another autocomplete interaction.
@@ -330,7 +633,8 @@ async function handleAutocomplete(interaction) {
       return;
     }
 
-    await interaction.respond(
+    await respondToAutocomplete(
+      interaction,
       choices
         .filter((choice) => choice?.name && choice?.value)
         .slice(0, 25)
@@ -343,7 +647,7 @@ async function handleAutocomplete(interaction) {
     // Discord invalidates autocomplete interactions very quickly. An expired
     // request is expected when a newer keystroke supersedes it, so do not flood
     // the console or attempt a second response for these known codes.
-    if (isExpiredInteractionError(error)) {
+    if (isIgnorableAutocompleteError(error)) {
       return;
     }
 
@@ -354,13 +658,13 @@ async function handleAutocomplete(interaction) {
     );
 
     if (
-      !interaction.responded &&
+      !respondedAutocompleteInteractions.has(interaction) &&
       latestAutocompleteRequests.get(requestKey) === interaction.id
     ) {
       try {
-        await interaction.respond([]);
+        await respondToAutocomplete(interaction, []);
       } catch (fallbackError) {
-        if (!isExpiredInteractionError(fallbackError)) {
+        if (!isIgnorableAutocompleteError(fallbackError)) {
           console.warn(
             `Autocomplete fallback failed for ` +
               `${interaction.commandName}/${focused.name}:`,
@@ -381,7 +685,7 @@ async function handleAddProof(interaction) {
     interaction.options.getString('proof', true).trim();
 
   if (!validHttpsUrl(proofUrl)) {
-    await interaction.reply({
+    await replyToInteraction(interaction, {
       content: '❌ The proof must be a valid HTTPS URL.',
       flags: MessageFlags.Ephemeral,
     });
@@ -406,7 +710,7 @@ async function handleAddProof(interaction) {
 
   const embed = successEmbed('Proof added', data);
 
-  await interaction.editReply({
+  await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
@@ -453,7 +757,7 @@ async function handleSongInfo(interaction) {
     });
   }
 
-  await interaction.editReply({
+  await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
@@ -468,7 +772,7 @@ async function handleEditProof(interaction) {
     interaction.options.getString('proof');
 
   if (playerOption === null && proofOption === null) {
-    await interaction.reply({
+    await replyToInteraction(interaction, {
       content:
         '❌ Supply a replacement player, a replacement proof URL, or both.',
       flags: MessageFlags.Ephemeral,
@@ -480,7 +784,7 @@ async function handleEditProof(interaction) {
     proofOption !== null &&
     !validHttpsUrl(proofOption.trim())
   ) {
-    await interaction.reply({
+    await replyToInteraction(interaction, {
       content: '❌ The proof must be a valid HTTPS URL.',
       flags: MessageFlags.Ephemeral,
     });
@@ -509,7 +813,7 @@ async function handleEditProof(interaction) {
 
   const embed = successEmbed('Proof updated', data);
 
-  await interaction.editReply({
+  await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
@@ -545,7 +849,7 @@ async function handleRemoveProof(interaction) {
     )
     .setTimestamp();
 
-  await interaction.editReply({
+  await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
@@ -709,7 +1013,7 @@ async function handleBotStatus(interaction) {
     });
   }
 
-  await interaction.editReply({
+  await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
@@ -731,7 +1035,7 @@ async function handleRefreshCatalog(interaction) {
   );
 
   if (result.deferred) {
-    await interaction.editReply({
+    await editInteractionReply(interaction, {
       content:
         'The backend index is currently busy. The bot will retry automatically.',
       allowedMentions: { parse: [] },
@@ -761,7 +1065,7 @@ async function handleRefreshCatalog(interaction) {
     )
     .setTimestamp();
 
-  await interaction.editReply({
+  await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
   });
@@ -794,7 +1098,7 @@ async function handleCommand(interaction) {
       return;
 
     default:
-      await interaction.reply({
+      await replyToInteraction(interaction, {
         content: 'Unknown command.',
         flags: MessageFlags.Ephemeral,
       });
@@ -811,6 +1115,8 @@ function getPublicHealthStatus() {
       ready: client.isReady(),
       user: client.user?.tag || null,
       guilds: client.guilds.cache.size,
+      interactionTransport: 'direct-http',
+      ipv4First: true,
     },
     autocomplete: {
       ready: catalog.ready,
