@@ -109,9 +109,26 @@ export const config = Object.freeze({
 
   ephemeralReplies: parseBoolean('EPHEMERAL_REPLIES', true),
 
-  appsScriptTimeoutMs: parsePositiveInteger(
-    'APPS_SCRIPT_TIMEOUT_MS',
+  // Keep ordinary backend calls safely below Discord's interaction-token
+  // lifetime. The value is capped even if a hosting-panel variable is set too
+  // high by mistake.
+  appsScriptTimeoutMs: Math.min(
+    parsePositiveInteger('APPS_SCRIPT_TIMEOUT_MS', 60_000),
     120_000,
+  ),
+
+  // /botstatus should never wait on a slow backend for minutes. It will show
+  // local status plus a clear backend timeout instead.
+  botStatusTimeoutMs: Math.min(
+    parsePositiveInteger('BOT_STATUS_TIMEOUT_MS', 10_000),
+    30_000,
+  ),
+
+  // Read-only song lookups should fail visibly rather than leaving Discord on
+  // "Bot is thinking..." for an extended period.
+  songInfoTimeoutMs: Math.min(
+    parsePositiveInteger('SONG_INFO_TIMEOUT_MS', 30_000),
+    60_000,
   ),
 
   autocompleteTimeoutMs: Math.min(

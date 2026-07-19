@@ -419,7 +419,11 @@ async function handleSongInfo(interaction) {
   await deferCommand(interaction);
 
   const songRef = await resolveSongReference(songInput);
-  const data = await callAppsScript('song', { songRef });
+  const data = await callAppsScript(
+    'song',
+    { songRef },
+    { timeoutMs: config.songInfoTimeoutMs },
+  );
 
   const embed = new EmbedBuilder()
     .setTitle(truncate(data.song || 'Song information', 256))
@@ -550,13 +554,37 @@ async function handleRemoveProof(interaction) {
 async function handleBotStatus(interaction) {
   await deferCommand(interaction);
 
-  const data = await callAppsScript('health');
+  const localCatalog = getAutocompleteCatalogStatus();
+  let data = null;
+  let backendError = null;
+
+  try {
+    data = await callAppsScript(
+      'health',
+      {},
+      { timeoutMs: config.botStatusTimeoutMs },
+    );
+  } catch (error) {
+    backendError = error;
+
+    console.warn(
+      `Backend health check failed after at most ` +
+        `${config.botStatusTimeoutMs} ms:`,
+      error,
+    );
+  }
+
   const backend = data?.backend || {};
   const songIndex = data?.songIndexRebuild || {};
   const remoteCatalog = data?.autocompleteCatalog || {};
-  const localCatalog = getAutocompleteCatalogStatus();
+
+  const remoteRevision =
+    remoteCatalog.revision ||
+    localCatalog.remoteRevision ||
+    'Unknown';
 
   const healthy =
+    !backendError &&
     backend.ok !== false &&
     backend.spreadsheetAccessible !== false;
 
@@ -565,17 +593,32 @@ async function handleBotStatus(interaction) {
   if (localCatalog.refreshing) {
     autocompleteState = 'Refreshing';
   } else if (localCatalog.ready) {
-    autocompleteState =
-      localCatalog.token === String(remoteCatalog.catalogToken || '')
-        ? 'Synchronized'
-        : 'Update pending';
+    if (backendError) {
+      autocompleteState = 'Ready locally';
+    } else {
+      autocompleteState =
+        localCatalog.token === String(remoteCatalog.catalogToken || '')
+          ? 'Synchronized'
+          : 'Update pending';
+    }
   } else if (localCatalog.lastError) {
     autocompleteState = 'Load failed';
   }
 
+  let spreadsheetState = 'Unavailable';
+
+  if (backendError) {
+    spreadsheetState =
+      backendError.code === 'API_TIMEOUT'
+        ? 'Check timed out'
+        : 'Check failed';
+  } else if (backend.spreadsheetAccessible) {
+    spreadsheetState = 'Connected';
+  }
+
   const embed = new EmbedBuilder()
     .setTitle('FCBot status')
-    .setColor(healthy ? 0x57f287 : 0xed4245)
+    .setColor(healthy ? 0x57f287 : 0xfee75c)
     .addFields(
       {
         name: 'Discord',
@@ -584,9 +627,7 @@ async function handleBotStatus(interaction) {
       },
       {
         name: 'Spreadsheet',
-        value: backend.spreadsheetAccessible
-          ? 'Connected'
-          : 'Unavailable',
+        value: spreadsheetState,
         inline: true,
       },
       {
@@ -596,12 +637,18 @@ async function handleBotStatus(interaction) {
       },
       {
         name: 'Indexed songs',
-        value: String(songIndex.indexedSongs ?? 'Unknown'),
+        value: String(
+          songIndex.indexedSongs ??
+          localCatalog.songs ??
+          'Unknown'
+        ),
         inline: true,
       },
       {
         name: 'Index state',
-        value: songIndex.dirty ? 'Needs rebuild' : 'Ready',
+        value: backendError
+          ? 'Remote check unavailable'
+          : (songIndex.dirty ? 'Needs rebuild' : 'Ready'),
         inline: true,
       },
       {
@@ -618,7 +665,7 @@ async function handleBotStatus(interaction) {
         name: 'Catalog revision',
         value:
           `${localCatalog.revision || 'None'} / ` +
-          `${remoteCatalog.revision || 'Unknown'}`,
+          `${remoteRevision}`,
         inline: true,
       },
       {
@@ -640,6 +687,16 @@ async function handleBotStatus(interaction) {
       },
     )
     .setTimestamp();
+
+  if (backendError) {
+    embed.addFields({
+      name: 'Backend health check',
+      value: truncate(
+        `${backendError.code || 'ERROR'}: ${backendError.message}`,
+        1_024,
+      ),
+    });
+  }
 
   if (localCatalog.lastError) {
     embed.addFields({

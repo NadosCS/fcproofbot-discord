@@ -55,15 +55,45 @@ export function clearAutocompleteCache() {
   requestCache.clear();
 }
 
-function makeTimeoutSignal(timeoutMs) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  timeout.unref?.();
+function makeApiTimeoutError(timeoutMs) {
+  return new AppsScriptApiError(
+    `The Apps Script request exceeded ${timeoutMs} ms.`,
+    {
+      code: 'API_TIMEOUT',
+    },
+  );
+}
 
-  return {
-    signal: controller.signal,
-    cancel: () => clearTimeout(timeout),
-  };
+/**
+ * Runs one Apps Script request behind both:
+ * - an AbortController, which cancels fetch/body reading, and
+ * - an explicit Promise race, which guarantees the caller is released when
+ *   the deadline is reached.
+ *
+ * The timer is intentionally NOT unref'd. On some game/bot hosting panels,
+ * unref'd timers can be delayed while the container is being paused or
+ * rescheduled.
+ */
+async function withHardTimeout(requestFactory, timeoutMs) {
+  const controller = new AbortController();
+  const timeoutError = makeApiTimeoutError(timeoutMs);
+  let timeoutHandle;
+
+  const timeoutPromise = new Promise((resolve, reject) => {
+    timeoutHandle = setTimeout(() => {
+      controller.abort(timeoutError);
+      reject(timeoutError);
+    }, timeoutMs);
+  });
+
+  try {
+    return await Promise.race([
+      requestFactory(controller.signal),
+      timeoutPromise,
+    ]);
+  } finally {
+    clearTimeout(timeoutHandle);
+  }
 }
 
 async function parseJsonResponse(response) {
@@ -92,71 +122,89 @@ export async function callAppsScript(
   payload = {},
   { timeoutMs = config.appsScriptTimeoutMs } = {},
 ) {
-  const { signal, cancel } = makeTimeoutSignal(timeoutMs);
+  const startedAt = Date.now();
 
   try {
-    const response = await fetch(config.appsScriptUrl, {
-      method: 'POST',
-      redirect: 'follow',
-      headers: {
-        'content-type': 'application/json; charset=utf-8',
-        accept: 'application/json',
-      },
-      body: JSON.stringify({
-        action,
-        apiKey: config.apiKey,
-        ...payload,
-      }),
-      signal,
-    });
-
-    const result = await parseJsonResponse(response);
-
-    if (!response.ok) {
-      throw new AppsScriptApiError(
-        result?.message || `Apps Script returned HTTP ${response.status}.`,
-        {
-          code: result?.code || 'HTTP_ERROR',
-          details: result?.details,
-          status: response.status,
+    return await withHardTimeout(async (signal) => {
+      const response = await fetch(config.appsScriptUrl, {
+        method: 'POST',
+        redirect: 'follow',
+        headers: {
+          'content-type': 'application/json; charset=utf-8',
+          accept: 'application/json',
         },
-      );
-    }
+        body: JSON.stringify({
+          action,
+          apiKey: config.apiKey,
+          ...payload,
+        }),
+        signal,
+      });
 
-    if (!result || result.ok !== true) {
-      throw new AppsScriptApiError(
-        result?.message || 'The Apps Script request failed.',
-        {
-          code: result?.code || 'BACKEND_ERROR',
-          details: result?.details,
-          status: response.status,
-        },
-      );
-    }
+      const result = await parseJsonResponse(response);
 
-    return result.data;
+      if (!response.ok) {
+        throw new AppsScriptApiError(
+          result?.message || `Apps Script returned HTTP ${response.status}.`,
+          {
+            code: result?.code || 'HTTP_ERROR',
+            details: result?.details,
+            status: response.status,
+          },
+        );
+      }
+
+      if (!result || result.ok !== true) {
+        throw new AppsScriptApiError(
+          result?.message || 'The Apps Script request failed.',
+          {
+            code: result?.code || 'BACKEND_ERROR',
+            details: result?.details,
+            status: response.status,
+          },
+        );
+      }
+
+      return result.data;
+    }, timeoutMs);
   } catch (error) {
-    if (error instanceof AppsScriptApiError) throw error;
+    if (error instanceof AppsScriptApiError) {
+      if (error.code === 'API_TIMEOUT') {
+        error.details = {
+          action,
+          timeoutMs,
+          elapsedMs: Date.now() - startedAt,
+        };
+      }
 
-    if (error?.name === 'AbortError') {
-      throw new AppsScriptApiError(
-        `The Apps Script request exceeded ${timeoutMs} ms.`,
-        {
-          code: 'API_TIMEOUT',
-          cause: error,
-        },
-      );
+      throw error;
+    }
+
+    if (
+      error?.name === 'AbortError' ||
+      error?.code === 'ABORT_ERR'
+    ) {
+      const timeoutError = makeApiTimeoutError(timeoutMs);
+      timeoutError.details = {
+        action,
+        timeoutMs,
+        elapsedMs: Date.now() - startedAt,
+      };
+      timeoutError.cause = error;
+      throw timeoutError;
     }
 
     throw new AppsScriptApiError(
       `Unable to contact Apps Script: ${error?.message || String(error)}`,
       {
         code: 'API_UNREACHABLE',
+        details: {
+          action,
+          elapsedMs: Date.now() - startedAt,
+        },
         cause: error,
       },
     );
-  } finally {
-    cancel();
   }
 }
 
