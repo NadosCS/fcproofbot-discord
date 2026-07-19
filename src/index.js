@@ -31,6 +31,11 @@ let catalogSynchronizerStopped = false;
 let healthServer = null;
 let shutdownStarted = false;
 
+// Tracks the newest autocomplete request for each user/command/option. Discord
+// can emit a new request for every keystroke, so older requests should not send
+// a response after a newer one has already replaced them.
+const latestAutocompleteRequests = new Map();
+
 function discordUserLabel(interaction) {
   const displayName =
     interaction.user.globalName || interaction.user.username;
@@ -43,6 +48,82 @@ function truncate(value, maxLength) {
 
   if (text.length <= maxLength) return text;
   return `${text.slice(0, Math.max(0, maxLength - 1))}…`;
+}
+
+function discordErrorCode(error) {
+  const rawCode = error?.code ?? error?.rawError?.code;
+  const parsed = Number(rawCode);
+
+  return Number.isInteger(parsed) ? parsed : null;
+}
+
+function isExpiredInteractionError(error) {
+  return [10015, 10062, 50027].includes(discordErrorCode(error));
+}
+
+function autocompleteRequestKey(interaction, focused) {
+  return [
+    interaction.guildId || 'direct-message',
+    interaction.user.id,
+    interaction.commandName,
+    focused.name,
+  ].join(':');
+}
+
+async function sendCommandError(interaction, error) {
+  if (!interaction.isRepliable()) return;
+
+  const content = errorMessage(error);
+  const responsePayload = {
+    content,
+    embeds: [],
+    allowedMentions: { parse: [] },
+  };
+
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await interaction.editReply(responsePayload);
+    } else {
+      await interaction.reply({
+        ...responsePayload,
+        flags: MessageFlags.Ephemeral,
+      });
+    }
+
+    return;
+  } catch (replyError) {
+    console.error(
+      `Failed to deliver the interaction error for ` +
+        `/${interaction.commandName} (${interaction.id}):`,
+      replyError,
+    );
+  }
+
+  // If Discord has invalidated the interaction webhook, fall back to a normal
+  // channel message so the command never remains on "Bot is thinking..."
+  // without any visible explanation.
+  const channel = interaction.channel;
+
+  if (
+    channel?.isTextBased?.() &&
+    typeof channel.send === 'function'
+  ) {
+    try {
+      await channel.send({
+        content: `<@${interaction.user.id}> ${content}`,
+        allowedMentions: {
+          parse: [],
+          users: [interaction.user.id],
+        },
+      });
+    } catch (channelError) {
+      console.error(
+        `Failed to send the fallback channel error for ` +
+          `/${interaction.commandName} (${interaction.id}):`,
+        channelError,
+      );
+    }
+  }
 }
 
 function validHttpsUrl(value) {
@@ -223,22 +304,30 @@ function applyProofMutationAndScheduleSync(data) {
 async function handleAutocomplete(interaction) {
   const focused = interaction.options.getFocused(true);
   const query = String(focused.value || '').trim();
+  const requestKey = autocompleteRequestKey(interaction, focused);
 
-  if (!query) {
-    await interaction.respond([]);
-    return;
-  }
+  latestAutocompleteRequests.set(requestKey, interaction.id);
 
   try {
     let choices = [];
 
-    if (focused.name === 'song') {
-      const onlyUnfcd =
-        interaction.commandName === 'addproof';
+    if (query) {
+      if (focused.name === 'song') {
+        const onlyUnfcd =
+          interaction.commandName === 'addproof';
 
-      choices = await searchSongs(query, onlyUnfcd);
-    } else if (focused.name === 'player') {
-      choices = await searchPlayers(query);
+        choices = await searchSongs(query, onlyUnfcd);
+      } else if (focused.name === 'player') {
+        choices = await searchPlayers(query);
+      }
+    }
+
+    // A newer keystroke has already produced another autocomplete interaction.
+    // Do not waste time responding to this stale request.
+    if (
+      latestAutocompleteRequests.get(requestKey) !== interaction.id
+    ) {
+      return;
     }
 
     await interaction.respond(
@@ -251,14 +340,34 @@ async function handleAutocomplete(interaction) {
         })),
     );
   } catch (error) {
+    // Discord invalidates autocomplete interactions very quickly. An expired
+    // request is expected when a newer keystroke supersedes it, so do not flood
+    // the console or attempt a second response for these known codes.
+    if (isExpiredInteractionError(error)) {
+      return;
+    }
+
     console.warn(
       `Autocomplete failed for ` +
         `${interaction.commandName}/${focused.name}:`,
       error,
     );
 
-    if (!interaction.responded) {
-      await interaction.respond([]).catch(() => undefined);
+    if (
+      !interaction.responded &&
+      latestAutocompleteRequests.get(requestKey) === interaction.id
+    ) {
+      try {
+        await interaction.respond([]);
+      } catch (fallbackError) {
+        if (!isExpiredInteractionError(fallbackError)) {
+          console.warn(
+            `Autocomplete fallback failed for ` +
+              `${interaction.commandName}/${focused.name}:`,
+            fallbackError,
+          );
+        }
+      }
     }
   }
 }
@@ -678,39 +787,35 @@ client.once('clientReady', (readyClient) => {
 });
 
 client.on('interactionCreate', async (interaction) => {
+  if (interaction.isAutocomplete()) {
+    await handleAutocomplete(interaction);
+    return;
+  }
+
+  if (!interaction.isChatInputCommand()) return;
+
+  const startedAt = Date.now();
+
+  console.log(
+    `Command received: /${interaction.commandName} ` +
+      `(${interaction.id}) from ${discordUserLabel(interaction)}.`,
+  );
+
   try {
-    if (interaction.isAutocomplete()) {
-      await handleAutocomplete(interaction);
-      return;
-    }
+    await handleCommand(interaction);
 
-    if (interaction.isChatInputCommand()) {
-      await handleCommand(interaction);
-    }
+    console.log(
+      `Command completed: /${interaction.commandName} ` +
+        `(${interaction.id}) in ${Date.now() - startedAt} ms.`,
+    );
   } catch (error) {
-    console.error('Interaction failed:', error);
+    console.error(
+      `Command failed: /${interaction.commandName} ` +
+        `(${interaction.id}) after ${Date.now() - startedAt} ms:`,
+      error,
+    );
 
-    if (!interaction.isRepliable()) return;
-
-    const content = errorMessage(error);
-
-    if (interaction.deferred || interaction.replied) {
-      await interaction
-        .editReply({
-          content,
-          embeds: [],
-          allowedMentions: { parse: [] },
-        })
-        .catch(() => undefined);
-    } else {
-      await interaction
-        .reply({
-          content,
-          flags: MessageFlags.Ephemeral,
-          allowedMentions: { parse: [] },
-        })
-        .catch(() => undefined);
-    }
+    await sendCommandError(interaction, error);
   }
 });
 

@@ -674,11 +674,54 @@ function songMatchRank(record, queryKey) {
   return null;
 }
 
+function insertBoundedSorted(list, value, compare, limit) {
+  let low = 0;
+  let high = list.length;
+
+  while (low < high) {
+    const middle = (low + high) >> 1;
+
+    if (compare(value, list[middle]) < 0) {
+      high = middle;
+    } else {
+      low = middle + 1;
+    }
+  }
+
+  if (low >= limit && list.length >= limit) return;
+
+  list.splice(low, 0, value);
+
+  if (list.length > limit) {
+    list.pop();
+  }
+}
+
+function compareSongRecords(left, right) {
+  const songComparison = left.song.localeCompare(
+    right.song,
+    undefined,
+    { sensitivity: 'base' },
+  );
+
+  if (songComparison !== 0) return songComparison;
+
+  return left.setlist.localeCompare(
+    right.setlist,
+    undefined,
+    { sensitivity: 'base' },
+  );
+}
+
 function searchLocalSongs(query, onlyUnfcd, limit = 25) {
   const queryKey = normalizeLookupText(query);
   if (!queryKey) return [];
 
-  const matches = [];
+  // Keep only the best `limit` records for each rank instead of collecting and
+  // sorting every match. Broad one-character queries can match thousands of
+  // songs; bounding each bucket prevents those autocomplete interactions from
+  // blocking the Node event loop.
+  const buckets = Array.from({ length: 5 }, () => []);
 
   for (const record of songCatalog) {
     if (onlyUnfcd && record.fcPlayer) continue;
@@ -686,35 +729,43 @@ function searchLocalSongs(query, onlyUnfcd, limit = 25) {
     const rank = songMatchRank(record, queryKey);
     if (rank === null) continue;
 
-    matches.push({ record, rank });
+    insertBoundedSorted(
+      buckets[rank],
+      record,
+      compareSongRecords,
+      limit,
+    );
   }
 
-  matches.sort((left, right) => {
-    if (left.rank !== right.rank) return left.rank - right.rank;
+  const output = [];
 
-    const songComparison = left.record.song.localeCompare(
-      right.record.song,
-      undefined,
-      { sensitivity: 'base' },
-    );
+  for (const bucket of buckets) {
+    for (const record of bucket) {
+      output.push(record);
+      if (output.length >= limit) return output;
+    }
+  }
 
-    if (songComparison !== 0) return songComparison;
+  return output;
+}
 
-    return left.record.setlist.localeCompare(
-      right.record.setlist,
-      undefined,
-      { sensitivity: 'base' },
-    );
-  });
+function comparePlayerRecords(left, right) {
+  if (left.fcCount !== right.fcCount) {
+    return right.fcCount - left.fcCount;
+  }
 
-  return matches.slice(0, limit).map(({ record }) => record);
+  return left.player.localeCompare(
+    right.player,
+    undefined,
+    { sensitivity: 'base' },
+  );
 }
 
 function searchLocalPlayers(query, limit = 25) {
   const queryKey = normalizeLookupText(query);
   if (!queryKey) return [];
 
-  const matches = [];
+  const buckets = Array.from({ length: 3 }, () => []);
 
   for (const record of playerCatalog) {
     let rank = null;
@@ -724,24 +775,25 @@ function searchLocalPlayers(query, limit = 25) {
     else if (record.playerKey.includes(queryKey)) rank = 2;
 
     if (rank === null) continue;
-    matches.push({ record, rank });
+
+    insertBoundedSorted(
+      buckets[rank],
+      record,
+      comparePlayerRecords,
+      limit,
+    );
   }
 
-  matches.sort((left, right) => {
-    if (left.rank !== right.rank) return left.rank - right.rank;
+  const output = [];
 
-    if (left.record.fcCount !== right.record.fcCount) {
-      return right.record.fcCount - left.record.fcCount;
+  for (const bucket of buckets) {
+    for (const record of bucket) {
+      output.push(record);
+      if (output.length >= limit) return output;
     }
+  }
 
-    return left.record.player.localeCompare(
-      right.record.player,
-      undefined,
-      { sensitivity: 'base' },
-    );
-  });
-
-  return matches.slice(0, limit).map(({ record }) => record);
+  return output;
 }
 
 export async function searchSongs(query, onlyUnfcd) {
