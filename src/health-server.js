@@ -66,11 +66,12 @@ export async function startHealthServer({ port, getStatus }) {
 
     if (pathname === '/health') {
       try {
+        const status = getStatus();
         writeJson(
           response,
-          200,
+          status?.ok === true ? 200 : 503,
           {
-            ...getStatus(),
+            ...status,
             checkedAt: new Date().toISOString(),
             uptimeSeconds: Math.floor(process.uptime()),
           },
