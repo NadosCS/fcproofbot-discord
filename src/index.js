@@ -464,6 +464,22 @@ function discordProofRejectedMessage() {
   );
 }
 
+/**
+ * Discord autocomplete displays player choices as:
+ *   Player Name — 20 FCs
+ *
+ * The actual choice value is only the player name. This extra normalization is
+ * a safety measure for manually typed labels and rare Discord/client cases
+ * where the visible label is submitted.
+ */
+function normalizeSubmittedPlayerName(value) {
+  const raw = String(value ?? '').trim();
+
+  return raw
+    .replace(/\s+[—–-]\s+\d+\s+FCs?$/iu, '')
+    .trim();
+}
+
 function replyVisibilityFlags() {
   return config.ephemeralReplies
     ? MessageFlags.Ephemeral
@@ -711,8 +727,16 @@ async function handleAutocomplete(interaction) {
 async function handleAddProof(interaction) {
   const songInput =
     interaction.options.getString('song', true);
-  const player =
-    interaction.options.getString('player', true).trim();
+  const rawPlayer =
+    interaction.options.getString('player', true);
+  const player = normalizeSubmittedPlayerName(rawPlayer);
+
+  if (player !== String(rawPlayer).trim()) {
+    console.warn(
+      `Normalized autocomplete player label "${String(rawPlayer).trim()}" ` +
+        `to "${player}".`,
+    );
+  }
   const proofUrl =
     interaction.options.getString('proof', true).trim();
 
@@ -851,7 +875,17 @@ async function handleEditProof(interaction) {
   };
 
   if (playerOption !== null) {
-    payload.player = playerOption.trim();
+    const normalizedPlayer =
+      normalizeSubmittedPlayerName(playerOption);
+
+    if (normalizedPlayer !== playerOption.trim()) {
+      console.warn(
+        `Normalized autocomplete player label "${playerOption.trim()}" ` +
+          `to "${normalizedPlayer}".`,
+      );
+    }
+
+    payload.player = normalizedPlayer;
   }
 
   if (proofOption !== null) {
