@@ -1192,12 +1192,13 @@ async function handleCommand(interaction) {
 
 function getPublicHealthStatus() {
   const catalog = getAutocompleteCatalogStatus();
+  const discordReady = client.isReady();
 
   return {
-    ok: true,
+    ok: discordReady,
     service: 'ultimate-clone-hero-fc-proof-bot',
     discord: {
-      ready: client.isReady(),
+      ready: discordReady,
       user: client.user?.tag || null,
       guilds: client.guilds.cache.size,
       interactionTransport: 'direct-http',
