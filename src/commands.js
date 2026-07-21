@@ -20,16 +20,22 @@ const playerOption = (option, required = true) =>
 export const commands = [
   new SlashCommandBuilder()
     .setName('addproof')
-    .setDescription('Add an FC player and proof link to an un-FC’d song')
+    .setDescription("Add an FC player and proof to an un-FC'd song")
     .addStringOption((option) =>
       songOption(option, 'Search for an un-FC’d song'),
     )
     .addStringOption((option) => playerOption(option, true))
+    .addAttachmentOption((option) =>
+      option
+        .setName('proof_image')
+        .setDescription('Upload a PNG, JPEG, or WebP proof screenshot')
+        .setRequired(false),
+    )
     .addStringOption((option) =>
       option
         .setName('proof')
-        .setDescription('HTTPS link to the image or video proof')
-        .setRequired(true)
+        .setDescription('Alternatively, provide an HTTPS image or video link')
+        .setRequired(false)
         .setMaxLength(2_000),
     ),
 

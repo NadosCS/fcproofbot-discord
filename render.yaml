@@ -21,8 +21,18 @@ services:
         sync: false
       - key: FCBOT_API_KEY
         sync: false
+      - key: B2_S3_ENDPOINT
+        sync: false
+      - key: B2_BUCKET
+        sync: false
+      - key: B2_KEY_ID
+        sync: false
+      - key: B2_APPLICATION_KEY
+        sync: false
       - key: EPHEMERAL_REPLIES
         value: "true"
+      - key: PROOF_IMAGE_MAX_MB
+        value: "10"
       - key: APPS_SCRIPT_TIMEOUT_MS
         value: "120000"
       - key: AUTOCOMPLETE_TIMEOUT_MS

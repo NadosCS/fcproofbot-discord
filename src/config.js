@@ -48,6 +48,107 @@ function parseBoolean(name, fallback) {
   throw new Error(`${name} must be true or false.`);
 }
 
+function optionalEnvironment(name) {
+  const value = process.env[name];
+  return value && value.trim() ? value.trim() : null;
+}
+
+function loadProofImageStorageConfig() {
+  const requiredNames = [
+    'B2_S3_ENDPOINT',
+    'B2_BUCKET',
+    'B2_KEY_ID',
+    'B2_APPLICATION_KEY',
+  ];
+  const suppliedNames = requiredNames.filter(optionalEnvironment);
+  const publicBaseUrlValue = optionalEnvironment('B2_PUBLIC_BASE_URL');
+
+  if (suppliedNames.length === 0 && !publicBaseUrlValue) {
+    return Object.freeze({ enabled: false });
+  }
+
+  const missingNames = requiredNames.filter(
+    (name) => !optionalEnvironment(name),
+  );
+  if (missingNames.length > 0) {
+    throw new Error(
+      `Incomplete Backblaze B2 configuration. Missing: ` +
+        `${missingNames.join(', ')}.`,
+    );
+  }
+
+  const endpointValue = optionalEnvironment('B2_S3_ENDPOINT');
+  let endpoint;
+  try {
+    endpoint = new URL(endpointValue);
+  } catch {
+    throw new Error('B2_S3_ENDPOINT is not a valid URL.');
+  }
+
+  if (
+    endpoint.protocol !== 'https:' ||
+    (endpoint.pathname !== '/' && endpoint.pathname !== '') ||
+    endpoint.search ||
+    endpoint.hash
+  ) {
+    throw new Error(
+      'B2_S3_ENDPOINT must be an HTTPS origin without a path or query.',
+    );
+  }
+
+  const endpointMatch = endpoint.hostname.match(
+    /^s3\.([a-z0-9-]+)\.backblazeb2\.com$/i,
+  );
+  if (!endpointMatch) {
+    throw new Error(
+      'B2_S3_ENDPOINT must be the S3 endpoint shown by Backblaze, such as ' +
+        'https://s3.us-west-004.backblazeb2.com.',
+    );
+  }
+
+  const bucket = optionalEnvironment('B2_BUCKET');
+  if (
+    !/^[a-z0-9][a-z0-9-]{4,61}[a-z0-9]$/.test(bucket)
+  ) {
+    throw new Error(
+      'B2_BUCKET must be 6-63 lowercase letters, numbers, or hyphens, ' +
+        'and must begin and end with a letter or number.',
+    );
+  }
+
+  let publicBaseUrl = `https://${bucket}.${endpoint.hostname}`;
+  if (publicBaseUrlValue) {
+    let parsedPublicBaseUrl;
+    try {
+      parsedPublicBaseUrl = new URL(publicBaseUrlValue);
+    } catch {
+      throw new Error('B2_PUBLIC_BASE_URL is not a valid URL.');
+    }
+
+    if (
+      parsedPublicBaseUrl.protocol !== 'https:' ||
+      parsedPublicBaseUrl.search ||
+      parsedPublicBaseUrl.hash
+    ) {
+      throw new Error(
+        'B2_PUBLIC_BASE_URL must be an HTTPS URL without a query or hash.',
+      );
+    }
+
+    publicBaseUrl = publicBaseUrlValue.replace(/\/+$/, '');
+  }
+
+  return Object.freeze({
+    enabled: true,
+    endpoint: endpoint.origin,
+    region: endpointMatch[1].toLowerCase(),
+    bucket,
+    keyId: optionalEnvironment('B2_KEY_ID'),
+    applicationKey: optionalEnvironment('B2_APPLICATION_KEY'),
+    publicBaseUrl,
+  });
+}
+
 function requireEnvironment() {
   const missing = REQUIRED_ENVIRONMENT_VARIABLES.filter(
     (name) => !process.env[name] || !process.env[name].trim(),
@@ -82,6 +183,8 @@ function requireEnvironment() {
 
 requireEnvironment();
 
+const proofImageStorage = loadProofImageStorageConfig();
+
 const autocompleteSyncMinutes = parsePositiveIntegerWithLegacy(
   'AUTOCOMPLETE_SYNC_MINUTES',
   'AUTOCOMPLETE_REFRESH_MINUTES',
@@ -106,6 +209,20 @@ export const config = Object.freeze({
   discordGuildId: process.env.DISCORD_GUILD_ID.trim(),
   appsScriptUrl: process.env.APPS_SCRIPT_URL.trim(),
   apiKey: process.env.FCBOT_API_KEY.trim(),
+
+  proofImageStorage,
+  proofImageMaxBytes:
+    Math.min(parsePositiveInteger('PROOF_IMAGE_MAX_MB', 10), 30) *
+    1_024 *
+    1_024,
+  proofImageDownloadTimeoutMs: Math.min(
+    parsePositiveInteger('PROOF_IMAGE_DOWNLOAD_TIMEOUT_MS', 15_000),
+    30_000,
+  ),
+  proofImageUploadTimeoutMs: Math.min(
+    parsePositiveInteger('PROOF_IMAGE_UPLOAD_TIMEOUT_MS', 30_000),
+    60_000,
+  ),
 
   ephemeralReplies: parseBoolean('EPHEMERAL_REPLIES', true),
 

@@ -23,6 +23,10 @@ import {
   startHealthServer,
   stopHealthServer,
 } from './health-server.js';
+import {
+  createProofImageStorage,
+  isDirectImageUrl,
+} from './proof-image-storage.js';
 
 // Wispbyte's outbound IPv6 route can intermittently stall while the Discord
 // Gateway remains connected. Prefer IPv4 for Discord/Google HTTPS lookups.
@@ -35,6 +39,15 @@ const client = new Client({
     retries: 0,
   },
 });
+
+const proofImageStorage = createProofImageStorage(
+  config.proofImageStorage,
+  {
+    maxBytes: config.proofImageMaxBytes,
+    downloadTimeoutMs: config.proofImageDownloadTimeoutMs,
+    uploadTimeoutMs: config.proofImageUploadTimeoutMs,
+  },
+);
 
 let catalogSyncTimer = null;
 let catalogSyncRunPromise = null;
@@ -461,8 +474,8 @@ function isDiscordProofUrl(value) {
 function discordProofRejectedMessage() {
   return (
     '❌ Discord-hosted proof links are not accepted because they may expire. ' +
-    'Please upload the proof to a permanent host such as ImgChest, Imgur, ' +
-    'YouTube, or Streamable, then submit that HTTPS link instead.'
+    'For /addproof, attach the file with proof_image instead. You can also ' +
+    'submit a permanent HTTPS image or video link.'
   );
 }
 
@@ -531,6 +544,10 @@ function successEmbed(title, data) {
       name: 'Proof',
       value: `[Open proof](${data.proofUrl})`,
     });
+
+    if (isDirectImageUrl(data.proofUrl)) {
+      embed.setImage(data.proofUrl);
+    }
   }
 
   return embed;
@@ -752,10 +769,29 @@ async function handleAddProof(interaction) {
         `to "${player}".`,
     );
   }
-  const proofUrl =
-    interaction.options.getString('proof', true).trim();
+  const proofOption = interaction.options.getString('proof');
+  const proofAttachment =
+    interaction.options.getAttachment('proof_image');
 
-  if (!validHttpsUrl(proofUrl)) {
+  if (proofOption === null && proofAttachment === null) {
+    await replyToInteraction(interaction, {
+      content: '❌ Attach a proof image or provide an HTTPS proof URL.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (proofOption !== null && proofAttachment !== null) {
+    await replyToInteraction(interaction, {
+      content: '❌ Provide either a proof image or a proof URL, not both.',
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  let proofUrl = proofOption?.trim() ?? null;
+
+  if (proofUrl !== null && !validHttpsUrl(proofUrl)) {
     await replyToInteraction(interaction, {
       content: '❌ The proof must be a valid HTTPS URL.',
       flags: MessageFlags.Ephemeral,
@@ -763,9 +799,19 @@ async function handleAddProof(interaction) {
     return;
   }
 
-  if (isDiscordProofUrl(proofUrl)) {
+  if (proofUrl !== null && isDiscordProofUrl(proofUrl)) {
     await replyToInteraction(interaction, {
       content: discordProofRejectedMessage(),
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+
+  if (proofAttachment !== null && !proofImageStorage.enabled) {
+    await replyToInteraction(interaction, {
+      content:
+        '❌ Image uploads are not configured yet. Submit a proof URL ' +
+        'instead or ask an administrator to configure Backblaze B2.',
       flags: MessageFlags.Ephemeral,
     });
     return;
@@ -777,6 +823,15 @@ async function handleAddProof(interaction) {
     songInput,
     { onlyUnfcd: true },
   );
+
+  if (proofAttachment !== null) {
+    const uploadedImage = await proofImageStorage.upload(proofAttachment);
+    proofUrl = uploadedImage.url;
+    console.log(
+      `Stored proof image ${uploadedImage.objectKey} ` +
+        `(${uploadedImage.size} bytes).`,
+    );
+  }
 
   const data = await callProofMutation('addProof', {
     songRef,
@@ -834,6 +889,10 @@ async function handleSongInfo(interaction) {
       name: 'Proof',
       value: `[Open proof](${data.proofUrl})`,
     });
+
+    if (isDirectImageUrl(data.proofUrl)) {
+      embed.setImage(data.proofUrl);
+    }
   }
 
   await editInteractionReply(interaction, {
