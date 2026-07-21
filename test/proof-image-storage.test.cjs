@@ -14,7 +14,8 @@ const storageConfig = Object.freeze({
 });
 
 const discordAttachmentUrl =
-  'https://cdn.discordapp.com/attachments/123/456/proof.png?ex=test';
+  'https://cdn.discordapp.com/ephemeral-attachments/123/456/' +
+  'proof.png?ex=test';
 
 test('uploads a verified Discord image to a stable public B2 URL', async () => {
   const { createProofImageStorage } = await storageModulePromise;

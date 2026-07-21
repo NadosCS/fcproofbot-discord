@@ -16,6 +16,11 @@ const DISCORD_ATTACHMENT_HOSTS = new Set([
   'media.discordapp.net',
 ]);
 
+const DISCORD_ATTACHMENT_PATH_PREFIXES = [
+  '/attachments/',
+  '/ephemeral-attachments/',
+];
+
 export class ProofImageStorageError extends Error {
   constructor(message, options = {}) {
     super(message);
@@ -45,7 +50,9 @@ function validateDiscordAttachmentUrl(value) {
   return (
     parsed.protocol === 'https:' &&
     DISCORD_ATTACHMENT_HOSTS.has(parsed.hostname.toLowerCase()) &&
-    parsed.pathname.startsWith('/attachments/')
+    DISCORD_ATTACHMENT_PATH_PREFIXES.some(
+      (prefix) => parsed.pathname.startsWith(prefix),
+    )
   );
 }
 

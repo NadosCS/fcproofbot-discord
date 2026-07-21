@@ -25,8 +25,8 @@ import {
 } from './health-server.js';
 import {
   createProofImageStorage,
-  isDirectImageUrl,
 } from './proof-image-storage.js';
+import { createProofPreviewResolver } from './proof-preview.js';
 
 // Wispbyte's outbound IPv6 route can intermittently stall while the Discord
 // Gateway remains connected. Prefer IPv4 for Discord/Google HTTPS lookups.
@@ -48,6 +48,8 @@ const proofImageStorage = createProofImageStorage(
     uploadTimeoutMs: config.proofImageUploadTimeoutMs,
   },
 );
+
+const proofPreviewResolver = createProofPreviewResolver();
 
 let catalogSyncTimer = null;
 let catalogSyncRunPromise = null;
@@ -544,13 +546,16 @@ function successEmbed(title, data) {
       name: 'Proof',
       value: `[Open proof](${data.proofUrl})`,
     });
-
-    if (isDirectImageUrl(data.proofUrl)) {
-      embed.setImage(data.proofUrl);
-    }
   }
 
   return embed;
+}
+
+async function addProofPreview(embed, proofUrl) {
+  if (!proofUrl) return;
+
+  const previewUrl = await proofPreviewResolver.resolve(proofUrl);
+  if (previewUrl) embed.setImage(previewUrl);
 }
 
 function errorMessage(error) {
@@ -843,6 +848,7 @@ async function handleAddProof(interaction) {
   applyProofMutationAndScheduleSync(data);
 
   const embed = successEmbed('Proof added', data);
+  await addProofPreview(embed, data.proofUrl);
 
   await editInteractionReply(interaction, {
     embeds: [embed],
@@ -890,9 +896,7 @@ async function handleSongInfo(interaction) {
       value: `[Open proof](${data.proofUrl})`,
     });
 
-    if (isDirectImageUrl(data.proofUrl)) {
-      embed.setImage(data.proofUrl);
-    }
+    await addProofPreview(embed, data.proofUrl);
   }
 
   await editInteractionReply(interaction, {
@@ -971,6 +975,7 @@ async function handleEditProof(interaction) {
   applyProofMutationAndScheduleSync(data);
 
   const embed = successEmbed('Proof updated', data);
+  await addProofPreview(embed, data.proofUrl);
 
   await editInteractionReply(interaction, {
     embeds: [embed],
