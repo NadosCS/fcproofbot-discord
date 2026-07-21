@@ -11,6 +11,7 @@ import {
   AppsScriptApiError,
   applyLocalProofMutation,
   callAppsScript,
+  callProofMutation,
   getAutocompleteCatalogStatus,
   searchPlayers,
   searchSongs,
@@ -36,6 +37,7 @@ const client = new Client({
 });
 
 let catalogSyncTimer = null;
+let catalogSyncRunPromise = null;
 let catalogSyncFailureCount = 0;
 let catalogSynchronizerStopped = false;
 let healthServer = null;
@@ -586,6 +588,17 @@ function scheduleCatalogSynchronization(
 }
 
 async function runCatalogSynchronization(reason, force = false) {
+  if (catalogSyncRunPromise) return catalogSyncRunPromise;
+
+  catalogSyncRunPromise = runCatalogSynchronizationOnce(reason, force)
+    .finally(() => {
+      catalogSyncRunPromise = null;
+    });
+
+  return catalogSyncRunPromise;
+}
+
+async function runCatalogSynchronizationOnce(reason, force = false) {
   try {
     const result = await synchronizeAutocompleteCatalog({
       force,
@@ -638,11 +651,13 @@ async function runCatalogSynchronization(reason, force = false) {
 function applyProofMutationAndScheduleSync(data) {
   const localUpdate = applyLocalProofMutation(data);
 
-  // When another sheet/index change happened before this proof command, the
-  // local revision cannot be safely advanced. Check immediately instead of
-  // waiting for the normal five-minute interval.
+  // A mutation whose exact revision was applied already leaves the local
+  // catalog current, so it needs only the normal periodic check. If another
+  // change raced ahead, perform one near-term reconciliation instead.
   scheduleCatalogSynchronization(
-    localUpdate.revisionApplied ? 2_000 : 500,
+    localUpdate.revisionApplied
+      ? config.autocompleteSyncCheckMs
+      : 2_000,
     'proof-mutation',
   );
 }
@@ -763,7 +778,7 @@ async function handleAddProof(interaction) {
     { onlyUnfcd: true },
   );
 
-  const data = await callAppsScript('addProof', {
+  const data = await callProofMutation('addProof', {
     songRef,
     player,
     proofUrl,
@@ -892,7 +907,7 @@ async function handleEditProof(interaction) {
     payload.proofUrl = proofOption.trim();
   }
 
-  const data = await callAppsScript('editProof', payload);
+  const data = await callProofMutation('editProof', payload);
 
   applyProofMutationAndScheduleSync(data);
 
@@ -912,7 +927,7 @@ async function handleRemoveProof(interaction) {
 
   const songRef = await resolveSongReference(songInput);
 
-  const data = await callAppsScript('removeProof', {
+  const data = await callProofMutation('removeProof', {
     songRef,
     discordUser: discordUserLabel(interaction),
   });

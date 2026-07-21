@@ -138,6 +138,14 @@ export const config = Object.freeze({
     120_000,
   ),
 
+  // Catalog status is a lightweight revision check. Failing it quickly keeps
+  // one transient Google response from occupying the synchronizer for a full
+  // minute while the previous complete local catalog remains usable.
+  autocompleteStatusTimeoutMs: Math.min(
+    parsePositiveInteger('AUTOCOMPLETE_STATUS_TIMEOUT_MS', 15_000),
+    30_000,
+  ),
+
   // /botstatus should never wait on a slow backend for minutes. It will show
   // local status plus a clear backend timeout instead.
   botStatusTimeoutMs: Math.min(
@@ -171,4 +179,15 @@ export const config = Object.freeze({
 
   autocompleteRetryBaseMs: autocompleteRetryBaseSeconds * 1_000,
   autocompleteRetryMaxMs: autocompleteRetryMaxMinutes * 60_000,
+
+  // BACKEND_BUSY is returned before a proof mutation begins, so retrying only
+  // that explicit code cannot duplicate a committed add/edit/remove.
+  proofBusyRetryAttempts: Math.min(
+    parsePositiveInteger('PROOF_BUSY_RETRY_ATTEMPTS', 2),
+    4,
+  ),
+  proofBusyRetryBaseMs: Math.min(
+    parsePositiveInteger('PROOF_BUSY_RETRY_BASE_MS', 750),
+    5_000,
+  ),
 });

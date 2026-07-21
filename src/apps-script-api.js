@@ -27,6 +27,7 @@ let catalogLastCheckedAt = null;
 let catalogLastError = null;
 let catalogLastErrorAt = null;
 let catalogRefreshPromise = null;
+let catalogSyncPromise = null;
 
 function cacheKey(action, payload) {
   return `${action}:${JSON.stringify(payload)}`;
@@ -103,12 +104,22 @@ async function parseJsonResponse(response) {
     return JSON.parse(text);
   } catch (cause) {
     const preview = text.replace(/\s+/g, ' ').trim().slice(0, 300);
+    const transientStatus =
+      response.status === 404 ||
+      response.status === 408 ||
+      response.status === 429 ||
+      response.status >= 500;
 
     throw new AppsScriptApiError(
-      'The Apps Script web app returned a non-JSON response. Confirm that the ' +
-        'latest deployment is public, executes as you, and uses the /exec URL.',
+      transientStatus
+        ? `Google temporarily returned HTTP ${response.status} instead of ` +
+          'the Apps Script JSON response.'
+        : 'The Apps Script web app returned a non-JSON response. Confirm that ' +
+          'the latest deployment is public, executes as you, and uses the /exec URL.',
       {
-        code: 'INVALID_API_RESPONSE',
+        code: transientStatus
+          ? 'TRANSIENT_API_RESPONSE'
+          : 'INVALID_API_RESPONSE',
         status: response.status,
         details: preview || null,
         cause,
@@ -208,10 +219,60 @@ export async function callAppsScript(
   }
 }
 
+function waitForRetry(delayMs) {
+  if (!Number.isFinite(delayMs) || delayMs <= 0) return Promise.resolve();
+  return new Promise((resolve) => setTimeout(resolve, delayMs));
+}
+
+/**
+ * Retries proof mutations only after the explicit BACKEND_BUSY response. That
+ * response is generated before the Apps Script mutation callback starts, so
+ * it is safe to retry. Transport errors and timeouts are never retried because
+ * the caller cannot know whether a mutation committed before the connection
+ * failed.
+ */
+export async function callProofMutation(
+  action,
+  payload = {},
+  { retryDelaysMs = null } = {},
+) {
+  const allowedActions = new Set(['addProof', 'editProof', 'removeProof']);
+  if (!allowedActions.has(action)) {
+    throw new TypeError(`Unsupported proof mutation action: ${action}`);
+  }
+
+  const delays = Array.isArray(retryDelaysMs)
+    ? retryDelaysMs.slice()
+    : Array.from(
+        { length: config.proofBusyRetryAttempts },
+        (_value, index) => config.proofBusyRetryBaseMs * (2 ** index),
+      );
+
+  for (let attempt = 0; ; attempt += 1) {
+    try {
+      return await callAppsScript(action, payload);
+    } catch (error) {
+      if (error?.code !== 'BACKEND_BUSY' || attempt >= delays.length) {
+        throw error;
+      }
+
+      const delayMs = Math.max(0, Number(delays[attempt]) || 0);
+      console.warn(
+        `Apps Script was busy for ${action}; retrying in ${delayMs} ms ` +
+          `(${attempt + 1}/${delays.length}).`,
+      );
+      await waitForRetry(delayMs);
+    }
+  }
+}
+
 function normalizeLookupText(value) {
   return String(value || '')
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .replace(/[\u2018\u2019]/g, "'")
+    .replace(/[\u201c\u201d]/g, '"')
     .trim()
     .toLowerCase()
     .replace(/\s+/g, ' ');
@@ -356,7 +417,7 @@ export async function fetchAutocompleteCatalogStatus() {
   const data = await callAppsScript(
     'catalogStatus',
     {},
-    { timeoutMs: config.appsScriptTimeoutMs },
+    { timeoutMs: config.autocompleteStatusTimeoutMs },
   );
 
   const status = normalizeRemoteCatalogStatus(data);
@@ -650,54 +711,60 @@ export async function synchronizeAutocompleteCatalog({
   logProgress = false,
   reason = 'scheduled',
 } = {}) {
-  if (catalogRefreshPromise) return catalogRefreshPromise;
+  if (catalogSyncPromise) return catalogSyncPromise;
 
-  try {
-    const remote = await fetchAutocompleteCatalogStatus();
+  catalogSyncPromise = (async () => {
+    try {
+      const remote = await fetchAutocompleteCatalogStatus();
 
-    if (remote.busy || remote.dirty) {
-      return {
-        ...getAutocompleteCatalogStatus(),
-        changed: false,
-        deferred: true,
-        reason,
-      };
+      if (remote.busy || remote.dirty) {
+        return {
+          ...getAutocompleteCatalogStatus(),
+          changed: false,
+          deferred: true,
+          reason,
+        };
+      }
+
+      const needsRefresh =
+        force ||
+        !catalogReady ||
+        catalogToken !== remote.token ||
+        catalogRevision !== remote.revision ||
+        catalogPlayerRevision !== remote.playerRevision ||
+        songCatalog.length !== remote.totalSongs ||
+        playerCatalog.length !== remote.totalPlayers;
+
+      if (!needsRefresh) {
+        clearCatalogError();
+
+        return {
+          ...getAutocompleteCatalogStatus(),
+          changed: false,
+          deferred: false,
+          reason,
+        };
+      }
+
+      return refreshAutocompleteCatalog({
+        logProgress,
+        expectedRevision: remote.revision,
+      });
+    } catch (error) {
+      rememberCatalogError(error);
+      throw error;
     }
+  })().finally(() => {
+    catalogSyncPromise = null;
+  });
 
-    const needsRefresh =
-      force ||
-      !catalogReady ||
-      catalogToken !== remote.token ||
-      catalogRevision !== remote.revision ||
-      catalogPlayerRevision !== remote.playerRevision ||
-      songCatalog.length !== remote.totalSongs ||
-      playerCatalog.length !== remote.totalPlayers;
-
-    if (!needsRefresh) {
-      clearCatalogError();
-
-      return {
-        ...getAutocompleteCatalogStatus(),
-        changed: false,
-        deferred: false,
-        reason,
-      };
-    }
-
-    return refreshAutocompleteCatalog({
-      logProgress,
-      expectedRevision: remote.revision,
-    });
-  } catch (error) {
-    rememberCatalogError(error);
-    throw error;
-  }
+  return catalogSyncPromise;
 }
 
 export function getAutocompleteCatalogStatus() {
   return {
     ready: catalogReady,
-    refreshing: Boolean(catalogRefreshPromise),
+    refreshing: Boolean(catalogSyncPromise || catalogRefreshPromise),
     songs: songCatalog.length,
     players: playerCatalog.length,
     revision: catalogRevision,
@@ -857,7 +924,7 @@ export async function searchSongs(query, onlyUnfcd) {
 
   // Do not repeatedly start slow web requests while the startup catalog is
   // still loading. Discord will show no options for those few seconds.
-  if (catalogRefreshPromise) return [];
+  if (catalogSyncPromise || catalogRefreshPromise) return [];
 
   const payload = {
     q: normalizedQuery,
@@ -897,7 +964,7 @@ export async function searchPlayers(query) {
     });
   }
 
-  if (catalogRefreshPromise) return [];
+  if (catalogSyncPromise || catalogRefreshPromise) return [];
 
   const payload = {
     q: normalizedQuery,
@@ -921,6 +988,46 @@ export async function searchPlayers(query) {
 
 function isSongReference(value) {
   return /^\d+:\d+$/.test(String(value || '').trim());
+}
+
+function autocompleteSongLabelParts(rawInput) {
+  const text = String(rawInput || '').trim();
+  const separators = [...text.matchAll(/\s+[—–]\s+/g)];
+
+  // The displayed label is "song — setlist". Try separators from right to
+  // left so a dash inside the song title is preserved whenever possible.
+  return separators
+    .reverse()
+    .map((match) => ({
+      song: text.slice(0, match.index).trim(),
+      setlist: text.slice(match.index + match[0].length).trim(),
+    }))
+    .filter((parts) => parts.song && parts.setlist);
+}
+
+/** Resolves a typed Discord autocomplete display label against known rows. */
+export function resolveAutocompleteSongLabel(records, rawInput) {
+  const candidates = autocompleteSongLabelParts(rawInput);
+
+  for (const candidate of candidates) {
+    const songKey = normalizeLookupText(candidate.song);
+    const setlistKey = normalizeLookupText(candidate.setlist);
+    const matches = records.filter((record) =>
+      (record.songKey || normalizeLookupText(record.song)) === songKey &&
+      (record.setlistKey || normalizeLookupText(record.setlist)) === setlistKey);
+
+    if (matches.length === 1) return matches[0].songRef;
+
+    if (matches.length > 1) {
+      throw new AppsScriptApiError(
+        `More than one indexed song uses the label "${rawInput}". ` +
+          'Select one of the autocomplete suggestions.',
+        { code: 'AMBIGUOUS_SONG_QUERY' },
+      );
+    }
+  }
+
+  return null;
 }
 
 function chooseSongReference(records, rawInput) {
@@ -970,17 +1077,31 @@ export async function resolveSongReference(input, { onlyUnfcd = false } = {}) {
 
   if (isSongReference(rawInput)) return rawInput;
 
+  const labelParts = autocompleteSongLabelParts(rawInput);
+  const lookupInput = labelParts.length ? labelParts[0].song : rawInput;
+
   if (catalogReady) {
-    return chooseSongReference(
-      searchLocalSongs(rawInput, onlyUnfcd, 25),
-      rawInput,
+    const records = searchLocalSongs(
+      lookupInput,
+      onlyUnfcd,
+      labelParts.length ? 100 : 25,
     );
+    const labelReference = resolveAutocompleteSongLabel(records, rawInput);
+
+    if (labelReference) return labelReference;
+    if (labelParts.length) {
+      throw new AppsScriptApiError(`No song matched "${rawInput}".`, {
+        code: 'SONG_NOT_FOUND',
+      });
+    }
+
+    return chooseSongReference(records, rawInput);
   }
 
   const data = await callAppsScript(
     'songs',
     {
-      q: rawInput,
+      q: lookupInput,
       limit: 25,
       onlyUnfcd,
     },
@@ -997,6 +1118,14 @@ export async function resolveSongReference(input, { onlyUnfcd = false } = {}) {
       setlistKey: normalizeLookupText(record?.setlist),
     }))
     .filter((record) => record.songRef && record.song);
+
+  const labelReference = resolveAutocompleteSongLabel(records, rawInput);
+  if (labelReference) return labelReference;
+  if (labelParts.length) {
+    throw new AppsScriptApiError(`No song matched "${rawInput}".`, {
+      code: 'SONG_NOT_FOUND',
+    });
+  }
 
   return chooseSongReference(records, rawInput);
 }
