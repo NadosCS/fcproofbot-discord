@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import {
+  DeleteObjectCommand,
   PutObjectCommand,
   S3Client,
 } from '@aws-sdk/client-s3';
@@ -20,6 +21,9 @@ const DISCORD_ATTACHMENT_PATH_PREFIXES = [
   '/attachments/',
   '/ephemeral-attachments/',
 ];
+
+const MANAGED_OBJECT_KEY =
+  /^proofs\/\d{4}\/\d{2}\/[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.(?:jpg|png|webp)$/i;
 
 export class ProofImageStorageError extends Error {
   constructor(message, options = {}) {
@@ -185,6 +189,9 @@ export function createProofImageStorage(
           { code: 'PROOF_IMAGE_STORAGE_NOT_CONFIGURED' },
         );
       },
+      async remove() {
+        return false;
+      },
     });
   }
 
@@ -206,6 +213,41 @@ export function createProofImageStorage(
 
   return Object.freeze({
     enabled: true,
+
+    async remove(storedImage) {
+      const objectKey = String(storedImage?.objectKey || '').trim();
+      if (!MANAGED_OBJECT_KEY.test(objectKey)) {
+        throw new ProofImageStorageError(
+          'Refusing to remove an unmanaged proof-image object.',
+          { code: 'INVALID_PROOF_IMAGE_OBJECT_KEY' },
+        );
+      }
+
+      try {
+        await withAbortTimeout(
+          uploadTimeoutMs,
+          (abortSignal) => client.send(
+            new DeleteObjectCommand({
+              Bucket: storageConfig.bucket,
+              Key: objectKey,
+            }),
+            { abortSignal },
+          ),
+        );
+      } catch (error) {
+        throw new ProofImageStorageError(
+          'Unable to remove the unused proof image from Backblaze B2.',
+          {
+            code: error?.name === 'AbortError'
+              ? 'PROOF_IMAGE_DELETE_TIMEOUT'
+              : 'PROOF_IMAGE_DELETE_FAILED',
+            cause: error,
+          },
+        );
+      }
+
+      return true;
+    },
 
     async upload(attachment) {
       const validationError = attachmentValidationError(

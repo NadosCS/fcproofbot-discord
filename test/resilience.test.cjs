@@ -18,6 +18,7 @@ function loadApiContext() {
       callAppsScript,
       callProofMutation,
       resolveAutocompleteSongLabel,
+      resolveSongSelection,
       synchronizeAutocompleteCatalog,
     };
   `;
@@ -64,6 +65,38 @@ function loadApiContext() {
   return context;
 }
 
+function loadAppsScriptContext() {
+  const context = vm.createContext({
+    Array,
+    Boolean,
+    Date,
+    Error,
+    JSON,
+    Map,
+    Math,
+    Number,
+    Object,
+    Set,
+    String,
+    console: { log() {}, warn() {}, error() {} },
+  });
+  const files = [
+    'Config.gs',
+    'Helpers.gs',
+    'SongIndex.gs',
+    'DiscordAPI.gs',
+  ];
+
+  for (const name of files) {
+    const filename = path.resolve(__dirname, '../apps-script', name);
+    vm.runInContext(fs.readFileSync(filename, 'utf8'), context, {
+      filename,
+    });
+  }
+
+  return context;
+}
+
 function jsonResponse(data, status = 200) {
   return new Response(JSON.stringify(data), {
     status,
@@ -93,6 +126,118 @@ test('typed autocomplete display labels resolve to their hidden song ref', () =>
     ),
     '123:45',
   );
+});
+
+test('stable song IDs are valid compact references', () => {
+  const context = loadAppsScriptContext();
+  const songId = '550e8400-e29b-41d4-a716-446655440000';
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(context.fcBotParseSongRef(`id:${songId}`))),
+    { songId, stable: true },
+  );
+  assert.equal(
+    context.fcBotCreateStableSongRef(songId.toUpperCase()),
+    `id:${songId}`,
+  );
+});
+
+test('expected song identity rejects a shifted legacy row', () => {
+  const context = loadAppsScriptContext();
+  let refreshes = 0;
+  context.fcBotUpdateSongIndexForSheetUnlocked_ = () => {
+    refreshes += 1;
+  };
+
+  assert.throws(
+    () => context.fcBotAssertExpectedSongIdentity_(
+      { songRef: '123:45' },
+      {
+        songName: 'Song Below',
+        sheetName: 'Setlist',
+        songId: '550e8400-e29b-41d4-a716-446655440000',
+        sheet: {},
+        row: 45,
+      },
+      {
+        expectedSong: 'Selected Song',
+        expectedSetlist: 'Setlist',
+      },
+    ),
+    (error) => error.code === 'STALE_SONG_REFERENCE',
+  );
+  assert.equal(refreshes, 1);
+});
+
+test('stable song IDs survive a unique song moving to another row', () => {
+  const context = loadAppsScriptContext();
+  const songId = '550e8400-e29b-41d4-a716-446655440000';
+  const rows = [[
+    '123:9',
+    'Moved Song',
+    'Setlist',
+    123,
+    9,
+    '',
+    '',
+    new Date(),
+    '',
+  ]];
+  const existing = [{
+    songId,
+    song: 'Moved Song',
+    setlist: 'Setlist',
+    sheetId: 123,
+    row: 10,
+  }];
+
+  context.Utilities = {
+    getUuid: () => {
+      throw new Error('a unique match should reuse its existing ID');
+    },
+  };
+  context.fcBotAssignStableSongIdsToRows_(rows, existing);
+
+  assert.equal(rows[0][0], `id:${songId}`);
+  assert.equal(rows[0][8], songId);
+  assert.equal(rows[0][4], 9);
+});
+
+test('ambiguous duplicate song names receive fresh Song Index-only IDs', () => {
+  const context = loadAppsScriptContext();
+  const oldIds = [
+    '550e8400-e29b-41d4-a716-446655440000',
+    '550e8400-e29b-41d4-a716-446655440001',
+  ];
+  const newIds = [
+    '550e8400-e29b-41d4-a716-446655440010',
+    '550e8400-e29b-41d4-a716-446655440011',
+  ];
+  const rows = [
+    ['123:4', 'Duplicate', 'Setlist', 123, 4, '', '', new Date(), ''],
+    ['123:8', 'Duplicate', 'Setlist', 123, 8, '', '', new Date(), ''],
+  ];
+  const existing = [
+    { songId: oldIds[0], song: 'Duplicate', sheetId: 123, row: 5 },
+    { songId: oldIds[1], song: 'Duplicate', sheetId: 123, row: 9 },
+  ];
+  let generated = 0;
+
+  context.Utilities = {
+    getUuid: () => newIds[generated++],
+  };
+  context.fcBotAssignStableSongIdsToRows_(rows, existing);
+
+  assert.deepEqual(
+    rows.map((row) => row[8]),
+    newIds,
+  );
+  assert.deepEqual(
+    rows.map((row) => row[0]),
+    newIds.map((songId) => `id:${songId}`),
+  );
+  assert.equal(rows[0].length, 9);
+  assert.equal(rows[1].length, 9);
 });
 
 test('proof mutations retry only explicit pre-commit BACKEND_BUSY responses', async () => {
@@ -153,6 +298,8 @@ test('Google HTML 404 responses are classified as transient', async () => {
 
 test('overlapping catalog synchronizations share one request sequence', async () => {
   const context = loadApiContext();
+  const stableRef =
+    'id:550e8400-e29b-41d4-a716-446655440000';
   let calls = 0;
   context.fetch = async (_url, options) => {
     calls += 1;
@@ -177,7 +324,7 @@ test('overlapping catalog synchronizations share one request sequence', async ()
     return jsonResponse({
       ok: true,
       data: {
-        songs: [['123:45', 'Song', 'Setlist', '']],
+        songs: [[stableRef, 'Song', 'Setlist', '']],
         players: [['Alice', 1]],
         totalSongs: 1,
         totalPlayers: 1,
@@ -198,4 +345,16 @@ test('overlapping catalog synchronizations share one request sequence', async ()
   assert.equal(first.changed, true);
   assert.equal(second.changed, true);
   assert.equal(first.songs, 1);
+
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(
+      await context.__api.resolveSongSelection(stableRef),
+    )),
+    {
+      songRef: stableRef,
+      songId: '550e8400-e29b-41d4-a716-446655440000',
+      song: 'Song',
+      setlist: 'Setlist',
+    },
+  );
 });

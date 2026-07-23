@@ -17,6 +17,7 @@ import {
   searchSongs,
   synchronizeAutocompleteCatalog,
   resolveSongReference,
+  resolveSongSelection,
 } from './apps-script-api.js';
 import { config } from './config.js';
 import {
@@ -589,6 +590,49 @@ function errorMessage(error) {
   );
 }
 
+function proofMutationIdentity(selection) {
+  return {
+    songRef: selection.songRef,
+    expectedSong: selection.song,
+    expectedSetlist: selection.setlist,
+    expectedSongId: selection.songId || undefined,
+  };
+}
+
+const DEFINITIVE_PROOF_REJECTION_CODES = new Set([
+  'ALREADY_FCD',
+  'BACKEND_BUSY',
+  'CONTRIBUTOR_SAFETY_NOT_INSTALLED',
+  'INVALID_PLAYER_NAME',
+  'INVALID_PROOF_URL',
+  'PLAYER_NOT_FOUND',
+  'PROOF_ALREADY_EXISTS',
+  'SONG_NOT_FOUND',
+  'STALE_SONG_REFERENCE',
+]);
+
+async function cleanupRejectedProofImage(uploadedImage, error) {
+  if (
+    !uploadedImage ||
+    !DEFINITIVE_PROOF_REJECTION_CODES.has(error?.code)
+  ) {
+    return;
+  }
+
+  try {
+    await proofImageStorage.remove(uploadedImage);
+    console.log(
+      `Removed unused proof image ${uploadedImage.objectKey} after ` +
+        `${error.code}.`,
+    );
+  } catch (cleanupError) {
+    console.warn(
+      `Unable to remove unused proof image ${uploadedImage.objectKey}:`,
+      cleanupError,
+    );
+  }
+}
+
 function formatCatalogTime(value) {
   if (!value) return 'Never';
 
@@ -846,13 +890,14 @@ async function handleAddProof(interaction) {
 
   await deferCommand(interaction);
 
-  const songRef = await resolveSongReference(
+  const songSelection = await resolveSongSelection(
     songInput,
     { onlyUnfcd: true },
   );
+  let uploadedImage = null;
 
   if (proofAttachment !== null) {
-    const uploadedImage = await proofImageStorage.upload(proofAttachment);
+    uploadedImage = await proofImageStorage.upload(proofAttachment);
     proofUrl = uploadedImage.url;
     replyAttachment = {
       bytes: uploadedImage.bytes,
@@ -866,12 +911,18 @@ async function handleAddProof(interaction) {
     );
   }
 
-  const data = await callProofMutation('addProof', {
-    songRef,
-    player,
-    proofUrl,
-    discordUser: discordUserLabel(interaction),
-  });
+  let data;
+  try {
+    data = await callProofMutation('addProof', {
+      ...proofMutationIdentity(songSelection),
+      player,
+      proofUrl,
+      discordUser: discordUserLabel(interaction),
+    });
+  } catch (error) {
+    await cleanupRejectedProofImage(uploadedImage, error);
+    throw error;
+  }
 
   applyProofMutationAndScheduleSync(data);
 
@@ -978,9 +1029,9 @@ async function handleEditProof(interaction) {
 
   await deferCommand(interaction);
 
-  const songRef = await resolveSongReference(songInput);
+  const songSelection = await resolveSongSelection(songInput);
   const payload = {
-    songRef,
+    ...proofMutationIdentity(songSelection),
     discordUser: discordUserLabel(interaction),
   };
 
@@ -1021,10 +1072,10 @@ async function handleRemoveProof(interaction) {
 
   await deferCommand(interaction);
 
-  const songRef = await resolveSongReference(songInput);
+  const songSelection = await resolveSongSelection(songInput);
 
   const data = await callProofMutation('removeProof', {
-    songRef,
+    ...proofMutationIdentity(songSelection),
     discordUser: discordUserLabel(interaction),
   });
 
@@ -1369,6 +1420,10 @@ client.on('interactionCreate', async (interaction) => {
         `(${interaction.id}) in ${Date.now() - startedAt} ms.`,
     );
   } catch (error) {
+    if (error?.code === 'STALE_SONG_REFERENCE') {
+      scheduleCatalogSynchronization(0, 'stale-song-reference', true);
+    }
+
     console.error(
       `Command failed: /${interaction.commandName} ` +
         `(${interaction.id}) after ${Date.now() - startedAt} ms:`,

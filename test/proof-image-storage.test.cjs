@@ -42,7 +42,7 @@ test('uploads a verified Discord image to a stable public B2 URL', async () => {
       },
     },
     now: () => new Date('2026-07-21T12:00:00.000Z'),
-    makeId: () => 'fixed-id',
+    makeId: () => '550e8400-e29b-41d4-a716-446655440000',
   });
 
   const result = await storage.upload({
@@ -56,7 +56,7 @@ test('uploads a verified Discord image to a stable public B2 URL', async () => {
   assert.equal(sent[0].command.input.Bucket, 'proof-bucket');
   assert.equal(
     sent[0].command.input.Key,
-    'proofs/2026/07/fixed-id.png',
+    'proofs/2026/07/550e8400-e29b-41d4-a716-446655440000.png',
   );
   assert.equal(sent[0].command.input.ContentType, 'image/png');
   assert.equal(sent[0].command.input.ContentDisposition, 'inline');
@@ -64,11 +64,19 @@ test('uploads a verified Discord image to a stable public B2 URL', async () => {
   assert.equal(
     result.url,
     'https://proof-bucket.s3.us-west-004.backblazeb2.com/' +
-      'proofs/2026/07/fixed-id.png',
+      'proofs/2026/07/550e8400-e29b-41d4-a716-446655440000.png',
   );
   assert.equal(result.size, png.length);
   assert.equal(result.filename, 'proof.png');
   assert.deepEqual(result.bytes, png);
+
+  assert.equal(await storage.remove(result), true);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].command.input.Bucket, 'proof-bucket');
+  assert.equal(
+    sent[1].command.input.Key,
+    'proofs/2026/07/550e8400-e29b-41d4-a716-446655440000.png',
+  );
 });
 
 test('rejects files whose bytes do not match the claimed image type', async () => {

@@ -337,10 +337,11 @@ function makeSongRecord(row) {
   const setlist = String(row[2] || '').trim();
   const fcPlayer = String(row[3] || '').trim();
 
-  if (!/^\d+:\d+$/.test(songRef) || !song) return null;
+  if (!isSongReference(songRef) || !song) return null;
 
   return {
     songRef,
+    songId: songIdFromReference(songRef),
     song,
     setlist,
     fcPlayer,
@@ -987,7 +988,44 @@ export async function searchPlayers(query) {
 }
 
 function isSongReference(value) {
-  return /^\d+:\d+$/.test(String(value || '').trim());
+  const normalized = String(value || '').trim();
+  return (
+    /^\d+:\d+$/.test(normalized) ||
+    /^id:[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
+      .test(normalized)
+  );
+}
+
+function songIdFromReference(value) {
+  const match = /^id:(.+)$/i.exec(String(value || '').trim());
+  return match ? match[1].toLowerCase() : '';
+}
+
+function songSelectionFromRecord(record) {
+  if (!record?.songRef || !record?.song) return null;
+  return {
+    songRef: String(record.songRef).trim(),
+    songId:
+      String(record.songId || '').trim() ||
+      songIdFromReference(record.songRef),
+    song: String(record.song).trim(),
+    setlist: String(record.setlist || '').trim(),
+  };
+}
+
+function findSongSelection(records, rawInput) {
+  const labelReference = resolveAutocompleteSongLabel(records, rawInput);
+  const songRef = labelReference || chooseSongReference(records, rawInput);
+  const selected = records.find(
+    (record) => String(record.songRef).trim() === songRef,
+  );
+  const selection = songSelectionFromRecord(selected);
+  if (selection) return selection;
+
+  throw new AppsScriptApiError(
+    'The selected song is no longer available. Select it again.',
+    { code: 'STALE_SONG_REFERENCE' },
+  );
 }
 
 function autocompleteSongLabelParts(rawInput) {
@@ -1066,7 +1104,10 @@ function chooseSongReference(records, rawInput) {
 /**
  * Accepts either the hidden autocomplete songRef or ordinary typed song text.
  */
-export async function resolveSongReference(input, { onlyUnfcd = false } = {}) {
+export async function resolveSongSelection(
+  input,
+  { onlyUnfcd = false } = {},
+) {
   const rawInput = String(input || '').trim();
 
   if (!rawInput) {
@@ -1075,7 +1116,28 @@ export async function resolveSongReference(input, { onlyUnfcd = false } = {}) {
     });
   }
 
-  if (isSongReference(rawInput)) return rawInput;
+  if (isSongReference(rawInput)) {
+    const localRecord = songCatalog.find(
+      (record) => record.songRef === rawInput,
+    );
+    const selection = songSelectionFromRecord(localRecord);
+    if (selection) return selection;
+
+    if (/^\d+:\d+$/.test(rawInput)) {
+      throw new AppsScriptApiError(
+        'The selected song came from an expired autocomplete catalog. ' +
+          'Select the song again.',
+        { code: 'STALE_SONG_REFERENCE' },
+      );
+    }
+
+    return {
+      songRef: rawInput,
+      songId: songIdFromReference(rawInput),
+      song: '',
+      setlist: '',
+    };
+  }
 
   const labelParts = autocompleteSongLabelParts(rawInput);
   const lookupInput = labelParts.length ? labelParts[0].song : rawInput;
@@ -1086,16 +1148,16 @@ export async function resolveSongReference(input, { onlyUnfcd = false } = {}) {
       onlyUnfcd,
       labelParts.length ? 100 : 25,
     );
-    const labelReference = resolveAutocompleteSongLabel(records, rawInput);
-
-    if (labelReference) return labelReference;
     if (labelParts.length) {
-      throw new AppsScriptApiError(`No song matched "${rawInput}".`, {
-        code: 'SONG_NOT_FOUND',
-      });
+      const labelReference = resolveAutocompleteSongLabel(records, rawInput);
+      if (!labelReference) {
+        throw new AppsScriptApiError(`No song matched "${rawInput}".`, {
+          code: 'SONG_NOT_FOUND',
+        });
+      }
     }
 
-    return chooseSongReference(records, rawInput);
+    return findSongSelection(records, rawInput);
   }
 
   const data = await callAppsScript(
@@ -1111,23 +1173,32 @@ export async function resolveSongReference(input, { onlyUnfcd = false } = {}) {
   const records = (Array.isArray(data?.songs) ? data.songs : [])
     .map((record) => ({
       songRef: String(record?.songRef || '').trim(),
+      songId:
+        String(record?.songId || '').trim() ||
+        songIdFromReference(record?.songRef),
       song: String(record?.song || '').trim(),
       setlist: String(record?.setlist || '').trim(),
       fcPlayer: String(record?.fcPlayer || '').trim(),
       songKey: normalizeLookupText(record?.song),
       setlistKey: normalizeLookupText(record?.setlist),
     }))
-    .filter((record) => record.songRef && record.song);
+    .filter((record) => isSongReference(record.songRef) && record.song);
 
-  const labelReference = resolveAutocompleteSongLabel(records, rawInput);
-  if (labelReference) return labelReference;
   if (labelParts.length) {
-    throw new AppsScriptApiError(`No song matched "${rawInput}".`, {
-      code: 'SONG_NOT_FOUND',
-    });
+    const labelReference = resolveAutocompleteSongLabel(records, rawInput);
+    if (!labelReference) {
+      throw new AppsScriptApiError(`No song matched "${rawInput}".`, {
+        code: 'SONG_NOT_FOUND',
+      });
+    }
   }
 
-  return chooseSongReference(records, rawInput);
+  return findSongSelection(records, rawInput);
+}
+
+export async function resolveSongReference(input, options = {}) {
+  const selection = await resolveSongSelection(input, options);
+  return selection.songRef;
 }
 
 function adjustLocalPlayer(playerName, delta) {
