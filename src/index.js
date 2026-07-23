@@ -23,6 +23,7 @@ import {
   startHealthServer,
   stopHealthServer,
 } from './health-server.js';
+import { createDiscordMultipartBody } from './discord-multipart.js';
 import {
   createProofImageStorage,
 } from './proof-image-storage.js';
@@ -164,6 +165,18 @@ async function directDiscordRequest(
   const controller = new AbortController();
   const timeoutError = discordRequestTimeoutError(timeoutMs, label);
   let timeoutHandle;
+  const multipart =
+    typeof FormData !== 'undefined' &&
+    body instanceof FormData;
+  const requestHeaders = {
+    accept: 'application/json',
+    ...headers,
+  };
+
+  if (!multipart && body !== undefined) {
+    requestHeaders['content-type'] =
+      'application/json; charset=utf-8';
+  }
 
   const timeoutPromise = new Promise((resolve, reject) => {
     timeoutHandle = setTimeout(() => {
@@ -175,14 +188,12 @@ async function directDiscordRequest(
   const requestPromise = (async () => {
     const response = await fetch(url, {
       method,
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/json; charset=utf-8',
-        ...headers,
-      },
+      headers: requestHeaders,
       body: body === undefined
         ? undefined
-        : JSON.stringify(body),
+        : multipart
+          ? body
+          : JSON.stringify(body),
       signal: controller.signal,
     });
 
@@ -290,7 +301,11 @@ async function replyToInteraction(interaction, payload) {
   acknowledgedInteractions.add(interaction);
 }
 
-async function editInteractionReply(interaction, payload) {
+async function editInteractionReply(
+  interaction,
+  payload,
+  attachment = null,
+) {
   if (!acknowledgedInteractions.has(interaction)) {
     throw new DiscordHttpError(
       'Cannot edit a Discord interaction before it has been acknowledged.',
@@ -300,9 +315,13 @@ async function editInteractionReply(interaction, payload) {
     );
   }
 
+  const apiPayload = discordApiPayload(payload);
+
   return directDiscordRequest(originalInteractionMessageUrl(interaction), {
     method: 'PATCH',
-    body: discordApiPayload(payload),
+    body: attachment
+      ? createDiscordMultipartBody(apiPayload, attachment)
+      : apiPayload,
     timeoutMs: config.discordResponseTimeoutMs,
     label: `Discord response for /${interaction.commandName}`,
   });
@@ -636,7 +655,9 @@ async function runCatalogSynchronizationOnce(reason, force = false) {
       );
 
       scheduleCatalogSynchronization(
-        config.autocompleteRetryBaseMs,
+        getAutocompleteCatalogStatus().ready
+          ? config.autocompleteSyncCheckMs
+          : config.autocompleteRetryBaseMs,
         'backend-busy',
       );
       return;
@@ -795,6 +816,7 @@ async function handleAddProof(interaction) {
   }
 
   let proofUrl = proofOption?.trim() ?? null;
+  let replyAttachment = null;
 
   if (proofUrl !== null && !validHttpsUrl(proofUrl)) {
     await replyToInteraction(interaction, {
@@ -832,6 +854,12 @@ async function handleAddProof(interaction) {
   if (proofAttachment !== null) {
     const uploadedImage = await proofImageStorage.upload(proofAttachment);
     proofUrl = uploadedImage.url;
+    replyAttachment = {
+      bytes: uploadedImage.bytes,
+      contentType: uploadedImage.contentType,
+      filename: uploadedImage.filename,
+      description: `Proof for ${songInput}`,
+    };
     console.log(
       `Stored proof image ${uploadedImage.objectKey} ` +
         `(${uploadedImage.size} bytes).`,
@@ -848,12 +876,16 @@ async function handleAddProof(interaction) {
   applyProofMutationAndScheduleSync(data);
 
   const embed = successEmbed('Proof added', data);
-  await addProofPreview(embed, data.proofUrl);
+  if (replyAttachment) {
+    embed.setImage(`attachment://${replyAttachment.filename}`);
+  } else {
+    await addProofPreview(embed, data.proofUrl);
+  }
 
   await editInteractionReply(interaction, {
     embeds: [embed],
     allowedMentions: { parse: [] },
-  });
+  }, replyAttachment);
 }
 
 async function handleSongInfo(interaction) {

@@ -42,7 +42,7 @@ services:
       - key: AUTOCOMPLETE_CATALOG_PAGE_SIZE
         value: "5000"
       - key: AUTOCOMPLETE_SYNC_MINUTES
-        value: "5"
+        value: "15"
       - key: AUTOCOMPLETE_RETRY_BASE_SECONDS
         value: "30"
       - key: AUTOCOMPLETE_RETRY_MAX_MINUTES

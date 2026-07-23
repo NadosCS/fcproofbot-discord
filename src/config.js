@@ -188,7 +188,7 @@ const proofImageStorage = loadProofImageStorageConfig();
 const autocompleteSyncMinutes = parsePositiveIntegerWithLegacy(
   'AUTOCOMPLETE_SYNC_MINUTES',
   'AUTOCOMPLETE_REFRESH_MINUTES',
-  5,
+  15,
 );
 
 const autocompleteRetryBaseSeconds = parsePositiveInteger(

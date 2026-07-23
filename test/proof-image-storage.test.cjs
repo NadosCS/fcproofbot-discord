@@ -67,6 +67,8 @@ test('uploads a verified Discord image to a stable public B2 URL', async () => {
       'proofs/2026/07/fixed-id.png',
   );
   assert.equal(result.size, png.length);
+  assert.equal(result.filename, 'proof.png');
+  assert.deepEqual(result.bytes, png);
 });
 
 test('rejects files whose bytes do not match the claimed image type', async () => {

@@ -323,7 +323,9 @@ export function createProofImageStorage(
         url: appendObjectKey(storageConfig.publicBaseUrl, objectKey),
         objectKey,
         contentType: detectedType,
+        filename: `proof${IMAGE_TYPES[detectedType]}`,
         size: bytes.length,
+        bytes,
       });
     },
   });
