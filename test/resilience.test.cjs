@@ -169,6 +169,37 @@ test('expected song identity rejects a shifted legacy row', () => {
   assert.equal(refreshes, 1);
 });
 
+test('expected song identity accepts a matching Song Index ID', () => {
+  const context = loadAppsScriptContext();
+  const songId = '550e8400-e29b-41d4-a716-446655440000';
+  let refreshes = 0;
+  context.fcBotUpdateSongIndexForSheetUnlocked_ = () => {
+    refreshes += 1;
+  };
+
+  assert.doesNotThrow(
+    () => context.fcBotAssertExpectedSongIdentity_(
+      {
+        songRef: `id:${songId}`,
+        songId,
+      },
+      {
+        songName: 'Selected Song',
+        sheetName: 'Setlist',
+        songId,
+        sheet: {},
+        row: 45,
+      },
+      {
+        expectedSong: 'Selected Song',
+        expectedSetlist: 'Setlist',
+        expectedSongId: songId,
+      },
+    ),
+  );
+  assert.equal(refreshes, 0);
+});
+
 test('stable song IDs survive a unique song moving to another row', () => {
   const context = loadAppsScriptContext();
   const songId = '550e8400-e29b-41d4-a716-446655440000';

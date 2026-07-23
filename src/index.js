@@ -16,7 +16,6 @@ import {
   searchPlayers,
   searchSongs,
   synchronizeAutocompleteCatalog,
-  resolveSongReference,
   resolveSongSelection,
 } from './apps-script-api.js';
 import { config } from './config.js';
@@ -945,10 +944,10 @@ async function handleSongInfo(interaction) {
 
   await deferCommand(interaction);
 
-  const songRef = await resolveSongReference(songInput);
+  const songSelection = await resolveSongSelection(songInput);
   const data = await callAppsScript(
     'song',
-    { songRef },
+    proofMutationIdentity(songSelection),
     { timeoutMs: config.songInfoTimeoutMs },
   );
 

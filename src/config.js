@@ -229,7 +229,7 @@ export const config = Object.freeze({
   // Discord requires the initial interaction acknowledgement within three
   // seconds. Keep this below that deadline.
   discordAckTimeoutMs: Math.min(
-    parsePositiveInteger('DISCORD_ACK_TIMEOUT_MS', 2_200),
+    parsePositiveInteger('DISCORD_ACK_TIMEOUT_MS', 2_700),
     2_700,
   ),
 

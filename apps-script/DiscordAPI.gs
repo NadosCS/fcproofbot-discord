@@ -34,7 +34,7 @@
  *   with fcBotGenerateAndStoreApiKey().
  */
 
-var FCBOT_API_VERSION = "1.4.0";
+var FCBOT_API_VERSION = "1.4.1";
 
 /** Apps Script web-app GET entry point. */
 function doGet(e) {
@@ -494,6 +494,7 @@ function fcBotApiSongInfo_(requestData) {
     }
 
     var live = fcBotRequireFreshSongReference_(record);
+    fcBotAssertExpectedSongIdentity_(record, live, requestData);
     var config = fcBotGetConfig();
     var player = fcBotNormalizeText(
       live.sheet.getRange(live.row, config.fcerColumn).getDisplayValue()
